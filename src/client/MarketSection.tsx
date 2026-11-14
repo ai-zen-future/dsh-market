@@ -42,12 +42,13 @@ import css from './Market.module.css'
 import { MARK_BLOCK_RADIUS, MARK_BLOCK_SIZE, MARK_GRID_BLOCKS, MARK_PLUG_BLOCK, MARK_VIEW_BOX } from './market-mark.ts'
 import { CommentsModal } from './CommentsModal.tsx'
 import { SearchInput } from './SearchInput.tsx'
+import { DiscoveryScan } from './discovery-scan.ts'
 import { downloadStatistic, downloadStatsText, starStatsText } from './download-stats.ts'
 import { OperationsPanel } from './OperationsPanel.tsx'
 import { applyRecovery, fetchRecovery, initialKeep, RecoveryPanel, watchRestart, type RecoveryView } from './RecoveryPanel.tsx'
 import { HostRecoveryBanner } from './HostRecoveryBanner.tsx'
 import { UpdateNotificationsPanel } from './UpdateNotificationsPanel.tsx'
-import { useUpdateNotifications, refreshUpdateNotifications, refreshUpdateNotificationsAfterChange, checkUpdateNotifications, setUpdateNotificationsEnabled, setUpdateNotificationsIntervalHours, ignoredUpdatesForBoot, notifyUpdatePreferencesChanged } from './update-notifications.ts'
+import { useUpdateNotifications, refreshUpdateNotifications, refreshUpdateNotificationsAfterChange, checkUpdateNotifications, setUpdateNotificationsEnabled, setUpdateNotificationsIntervalHours, ignoredUpdatesForBoot, notifyUpdatePreferencesChanged, type UpdateNotificationsState } from './update-notifications.ts'
 import { clearSettled, drop, enqueue, patch as patchRecord, recordForUrl, restoreSettled, serializeSettled, SETTLED_STORAGE_KEY } from './operations.ts'
 import { dismissedHostIdSet, rememberDismissedHostId } from './dismissed-host.ts'
 import type { OperationRecord } from './operations.ts'
@@ -63,7 +64,7 @@ import {
 } from './market-data.ts'
 import type {
 ActivationInfo, ActivationState, DrainHistoryWire, DrainOperationWire, GistExportResult, InstalledMap, InstalledRepoHints, InstalledRepoIdentities, InstalledSort, InstallStamp, MarketStatus, Registry, RegistryPlugin,
-  HostCompatibility, HostCompatibilityMap, ScreenshotCandidate, ScreenshotMeasurement, SharedHostPackageDependencyFinding, SortDir, SortField, ThemeSnapshot, TimeRange, Translate, UpdateStatus,
+  ScreenshotCandidate, ScreenshotMeasurement, SharedHostPackageDependencyFinding, SortDir, SortField, ThemeSnapshot, TimeRange, Translate, UpdateStatus,
 } from './market-data.ts'
 
 function isHostDependencyFinding(value: unknown): value is SharedHostPackageDependencyFinding {
@@ -85,13 +86,8 @@ const SLOW_INSTALL_SECONDS = 90
 /** How long the page keeps asking for a market DSH unloaded, and how long one ask may take (#1151). */
 const RECONNECT_BUDGET_MS = 90_000
 const RECONNECT_REQUEST_MS = 4000
+const UPDATE_CHECK_REQUEST_MS = 30_000
 const IGNORED_UPDATES_SESSION_KEY = 'dshm-updates-ignored'
-const UNAVAILABLE_HOST_COMPATIBILITY: HostCompatibility = {
-  status: 'unknown',
-  basis: 'unavailable',
-  requirement: null,
-  declarations: [],
-}
 
 function HostDependencyDiagnostics({
   findings,
@@ -871,6 +867,11 @@ export function resetThemePreviewCache(): void {
   measuredThemePreviewTasks.clear()
   measuredThemePreviewResults.clear()
 }
+
+const discoveryScan = new DiscoveryScan(() => {
+  resetScreenshotsCache()
+  resetThemePreviewCache()
+})
 
 /** README fetch + geometry probes, shared across search/page remounts. */
 function measuredThemePreview(plugin: RegistryPlugin): Promise<string[]> {
@@ -1848,20 +1849,60 @@ function CatalogVersionMark({ version, tip }: { version: string | null | undefin
  * the Installed tab's red dot / 「更新」buttons flash off then on, and the
  * two entries disagree until both refetches finish.
  */
-let cachedRegistry: Registry | null = null
 let cachedInstalled: InstalledMap | null = null
 let cachedLocalDescriptions: Record<string, string> = {}
 let cachedRepoIdentities: InstalledRepoIdentities | null = null
 let cachedRepoHints: InstalledRepoHints | null = null
-let cachedHostCompatibility: HostCompatibilityMap = {}
-let cachedHostVersion: string | null | undefined = undefined
-/** Names with an in-flight discovery-compatibility request (module-wide). */
-const hostCompatibilityInFlight = new Set<string>()
-/** Subscribers for useSyncExternalStore — every mounted MarketSection. */
-const hostCompatibilityListeners = new Set<() => void>()
-let cachedUpdates: Record<string, UpdateStatus> = {}
-/** False until /dsh-market/updates has answered at least once this process. */
-let cachedUpdatesReady = false
+interface UpdateCheckSnapshot {
+  updates: Record<string, UpdateStatus>
+  installed: InstalledMap
+  ready: boolean
+  /** null for a whole request failure, a set for failed packages only. */
+  failed: ReadonlySet<string> | null
+}
+
+const emptyUpdateCheck: UpdateCheckSnapshot = { updates: {}, installed: {}, ready: false, failed: new Set() }
+let updateCheckSnapshot = emptyUpdateCheck
+let updateCheckBoot: string | null = null
+let updateCheckRequest = 0
+let updateCheckCommitted = 0
+let installedCheckCommitted = 0
+const updateCheckListeners = new Set<() => void>()
+/** A manual check on either surface fences older background samples on both. */
+const pendingUpdateNotificationReads = new Set<number>()
+
+function getUpdateCheckSnapshot() { return updateCheckSnapshot }
+
+function subscribeUpdateCheck(listener: () => void): () => void {
+  updateCheckListeners.add(listener)
+  return () => { updateCheckListeners.delete(listener) }
+}
+
+function publishUpdateCheck(snapshot: UpdateCheckSnapshot): void {
+  updateCheckSnapshot = snapshot
+  for (const listener of updateCheckListeners) listener()
+}
+
+function releaseUpdateNotificationRead(request: number): void {
+  if (pendingUpdateNotificationReads.delete(request)) publishUpdateCheck({ ...updateCheckSnapshot })
+}
+
+function resetUpdateCheck(boot: string | null): void {
+  pendingUpdateNotificationReads.clear()
+  updateCheckBoot = boot
+  updateCheckCommitted = ++updateCheckRequest
+  installedCheckCommitted = updateCheckRequest
+  publishUpdateCheck(emptyUpdateCheck)
+}
+
+function observeUpdateCheckBoot(boot: string, previous: string | null): boolean {
+  if (previous !== updateCheckBoot) return false
+  if (updateCheckBoot === null) updateCheckBoot = boot
+  if (updateCheckBoot === boot) return false
+  resetUpdateCheck(boot)
+  return true
+}
+
 let cachedInstalledReady = false
 let cachedSkins: string[] = []
 let cachedDisabledNames: string[] = []
@@ -1886,11 +1927,8 @@ function cacheState<T>(write: (value: T) => void, setState: (value: T | ((curren
 
 /** Test helper: drop the shared surface caches between cases. */
 export function resetHostCompatibilityCache(): void {
-  cachedHostCompatibility = {}
-  cachedHostVersion = undefined
-  hostCompatibilityInFlight.clear()
-  cachedUpdates = {}
-  cachedUpdatesReady = false
+  discoveryScan.reset()
+  resetUpdateCheck(null)
   cachedInstalledReady = false
   cachedLocalDescriptions = {}
   cachedSkins = []
@@ -1901,32 +1939,6 @@ export function resetHostCompatibilityCache(): void {
   cachedInstalledBundles = []
   cachedActivations = {}
   cachedMarketVersion = null
-}
-
-/** Any cached answer counts — including unavailable. Re-querying every
- * remount used to re-POST thousands of names; a host-version change (below)
- * is what drops the map for a fresh scan. */
-function hostCompatibilitySettled(name: string): boolean {
-  return cachedHostCompatibility[name] !== undefined
-}
-
-function clearHostCompatibilityCache(): void {
-  cachedHostCompatibility = {}
-  hostCompatibilityInFlight.clear()
-  for (const listener of hostCompatibilityListeners) listener()
-}
-
-function subscribeHostCompatibility(onStoreChange: () => void): () => void {
-  hostCompatibilityListeners.add(onStoreChange)
-  return () => { hostCompatibilityListeners.delete(onStoreChange) }
-}
-
-/** Merge into the module cache and notify every mounted MarketSection — a
- * sidebar/settings switch used to drop in-flight setStates and leave the
- * note frozen at 「正在检查 665/2455」. */
-function commitHostCompatibility(accepted: HostCompatibilityMap): void {
-  cachedHostCompatibility = { ...cachedHostCompatibility, ...accepted }
-  for (const listener of hostCompatibilityListeners) listener()
 }
 
 /** Discover grid page-size choices — the catalog grows daily, so cap each page. */
@@ -2003,6 +2015,56 @@ function localDescriptionsFromUnknown(value: unknown): Record<string, string> {
 /** A `{name: {...}}` map, or anything else — for untyped server fields. */
 function isRecordOfRecords(value: unknown): value is Record<string, { spec?: string; reason?: string }> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isInstalledSnapshot(value: unknown): value is InstalledMap {
+  return isRecordOfRecords(value) && Object.values(value).every(spec => typeof spec === 'string')
+}
+
+function isUpdateStatus(value: unknown): value is UpdateStatus {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const status = value as UpdateStatus
+  return typeof status.updateAvailable === 'boolean'
+    && (status.checkFailed === undefined || status.checkFailed === true)
+    && (status.checkError === undefined || status.checkError === 'unavailable')
+    && (status.kind === undefined || typeof status.kind === 'string')
+    && (status.version === undefined || status.version === null || typeof status.version === 'string')
+    && (status.latest === undefined || status.latest === null || typeof status.latest === 'string')
+    && (status.current === undefined || status.current === null || typeof status.current === 'string')
+}
+
+function readUpdateStatuses(body: unknown): Record<string, UpdateStatus> {
+  const updates = (body as { updates?: unknown } | null)?.updates
+  if (!isRecordOfRecords(updates) || !Object.values(updates).every(isUpdateStatus)) {
+    throw new Error('Invalid update list')
+  }
+  return updates as Record<string, UpdateStatus>
+}
+
+function applyUpdateCheck(request: number, received: Record<string, UpdateStatus> | null, installed: InstalledMap | null): void {
+  if (request < updateCheckCommitted) return
+  updateCheckCommitted = request
+  const previous = updateCheckSnapshot
+  const hasSameSpec = (name: string) => installed?.[name] !== undefined && installed[name] === previous.installed[name]
+  if (received === null) {
+    // A failed response says nothing about eligibility. A fresh installed list
+    // can still rule out rows for older installs or removed programs.
+    const updates = installed === null ? previous.updates
+      : Object.fromEntries(Object.entries(previous.updates).filter(([name]) => hasSameSpec(name)))
+    publishUpdateCheck({ ...previous, updates, installed: installed ?? previous.installed, failed: null })
+    return
+  }
+  const failed = new Set<string>()
+  const updates = Object.fromEntries(Object.entries(received).map(([name, status]) => {
+    if (status.checkFailed !== true && status.checkError !== 'unavailable') return [name, status]
+    failed.add(name)
+    const confirmed = previous.updates[name]
+    // A name can be reinstalled with a different source or local version.
+    if (hasSameSpec(name) && confirmed?.checkFailed !== true && confirmed?.checkError !== 'unavailable' && typeof status.version === 'string'
+      && status.version === confirmed?.version && status.kind === confirmed.kind) return [name, confirmed]
+    return [name, status]
+  }))
+  publishUpdateCheck({ updates, installed: installed ?? {}, ready: installed !== null, failed })
 }
 
 function sameInstalledMap(left: InstalledMap, right: InstalledMap): boolean {
@@ -2215,18 +2277,6 @@ function withoutHostProjection(
 }
 
 /**
- * Whether the "compatible with this host" filter starts on, and remembers the
- * answer once the user disagrees with the default (#872).
- *
- * Storage may be unavailable (private mode, a locked-down webview); the
- * default is what matters, so a failure to read it is not a failure.
- */
-const HOST_FILTER_KEY = 'dshm-host-filter'
-function readHostFilterPreference(): boolean {
-  try { return localStorage.getItem(HOST_FILTER_KEY) !== 'all' } catch { return true }
-}
-
-/**
  * 最近收录 display preferences: collapsed / hidden (#940).
  *
  * The block only appears on the discover tab with an empty search and both
@@ -2235,7 +2285,7 @@ function readHostFilterPreference(): boolean {
  * are display preferences, not profile settings: since 0.1.7 the settings
  * surface is deliberately just `allowRestart`.
  *
- * Same read discipline as HOST_FILTER_KEY above: an unavailable store falls
+ * When localStorage is unavailable, the preference falls
  * back to the default, and the default is "expanded and shown".
  */
 const RECENT_COLLAPSED_KEY = 'dshm-recent-collapsed'
@@ -2419,6 +2469,8 @@ export function MarketSection(props: MarketSectionProps) {
   // once: the service arrives with the host's plugin manager, which may load
   // after this panel is already on screen.
   const notificationSnapshot = useUpdateNotifications()
+  const latestNotification = useRef(notificationSnapshot)
+  latestNotification.current = notificationSnapshot
   const hostNavigation = props.hostNavigation
   const openInHost = useSyncExternalStore(
     cb => hostNavigation?.subscribe(cb) ?? (() => {}),
@@ -2463,7 +2515,8 @@ export function MarketSection(props: MarketSectionProps) {
     props.themeStore.subscribe,
     props.themeStore.getSnapshot,
   )
-  const [data, setData] = useState<Registry | null>(cachedRegistry)
+  const compatibility = useSyncExternalStore(discoveryScan.subscribe, discoveryScan.getSnapshot)
+  const { catalog: data, enabled: compatibleWithHost, hostVersion, verdicts: hostCompatibility } = compatibility
   const [loadError, setLoadError] = useState<string | null>(null)
   /**
    * The host answered 404 on one of the market's own routes (#962).
@@ -2480,7 +2533,6 @@ export function MarketSection(props: MarketSectionProps) {
   const [reconnecting, setReconnecting] = useState(true)
   const [reconnectRound, setReconnectRound] = useState(0)
   const [installed, setInstalledState] = useState<InstalledMap>(cachedInstalled ?? {})
-  const setInstalled = useCallback((value: InstalledMap) => { cachedInstalled = value; setInstalledState(value) }, [])
   const [localDescriptions, setLocalDescriptionsState] = useState<Record<string, string>>(() => cachedLocalDescriptions)
   const setLocalDescriptions = useCallback(cacheState(value => { cachedLocalDescriptions = value }, setLocalDescriptionsState), [])
   const [repoIdentities, setRepoIdentitiesState] = useState<InstalledRepoIdentities>(cachedRepoIdentities ?? {})
@@ -2556,21 +2608,10 @@ export function MarketSection(props: MarketSectionProps) {
    * Persisted in localStorage so a refresh keeps the queue; only `queued`
    * records persist — `running` recovery stays on the dshm-pending paths.
    */
-  const [updates, setUpdatesState] = useState<Record<string, UpdateStatus>>(() => cachedUpdates)
-  const setUpdates = useCallback(cacheState(value => { cachedUpdates = value }, setUpdatesState), [])
-  // Background checks keep an already open market current without mounting a
-  // second scheduler. The server owns checking and preserves last-good results.
-  useEffect(() => {
-    if (!notificationSnapshot.loaded) return
-    setUpdates(notificationSnapshot.updates)
-    cachedUpdatesReady = notificationSnapshot.checkedAt !== null
-    setQueueSnapshotReady(ready => ({ ...ready, updates: cachedUpdatesReady }))
-  }, [notificationSnapshot.updates, notificationSnapshot.checkedAt, notificationSnapshot.loaded, setUpdates])
+  const updateCheck = useSyncExternalStore(subscribeUpdateCheck, getUpdateCheckSnapshot)
+  const { updates } = updateCheck
   const queueRestoredRef = useRef(false)
-  const [queueSnapshotReady, setQueueSnapshotReady] = useState({
-    installed: cachedInstalledReady,
-    updates: cachedUpdatesReady,
-  })
+  const [installedReady, setInstalledReady] = useState(cachedInstalledReady)
   useEffect(() => {
     if (queueRestoredRef.current) return
     let saved: unknown = null
@@ -2583,14 +2624,13 @@ export function MarketSection(props: MarketSectionProps) {
     }
     if (data === null) return
     // Cached or not-yet-loaded maps cannot judge a replacement's saved queue.
-    if (saved.some(row => row?.kind === 'update' || row?.kind === 'uninstall') && !queueSnapshotReady.installed) return
-    if (saved.some(row => row?.kind === 'update') && !queueSnapshotReady.updates) return
+    if (saved.some(row => row?.kind === 'update' || row?.kind === 'uninstall') && !installedReady) return
+    if (saved.some(row => row?.kind === 'update' && (
+      !updateCheck.ready || updateCheck.failed === null || updateCheck.failed.has(row.name)
+    ))) return
     queueRestoredRef.current = true
-    // Consumed only once the rows can actually be restored. Removing it
-    // earlier lost the queue outright: this effect runs on the first render,
-    // where `data === null` (the catalog has not arrived), and the run that
-    // follows found the storage empty — so a REFRESH with a pending queue, the
-    // case this feature exists for, threw it away.
+    // Claim the saved rows synchronously once they have enough evidence to
+    // restore, so a second mounted surface cannot restore the same tasks.
     try { localStorage.removeItem('dshm-queue-v1') } catch { /* storage unavailable */ }
     /**
      * A queued row may only run while the world it was queued in still holds.
@@ -2675,7 +2715,7 @@ export function MarketSection(props: MarketSectionProps) {
       return kept
     })
     setOperationsOpen(true)
-  }, [data, t, lang, queueSnapshotReady, installed, updates])
+  }, [data, t, lang, installedReady, installed, updateCheck, updates])
   useEffect(() => {
     // Never write before the restore has read. On the first render `records`
     // is empty, and this effect would then delete the stored queue that the
@@ -2819,7 +2859,7 @@ export function MarketSection(props: MarketSectionProps) {
     reason?: 'missing' | 'unavailable' | 'unreadable'
   }
   type ResolvedNotes =
-    | { kind: 'release'; release: NoteRelease; beyondTarget?: string }
+    | { kind: 'release'; release: NoteRelease; beyondTarget?: string; commits?: { items: NoteCommit[]; found: boolean } }
     | { kind: 'commits'; commits: { items: NoteCommit[]; found: boolean } }
     | { kind: 'npm'; npmTimes: Array<{ version: string; date: string }> }
     | { kind: 'source'; sourceUrl?: string | null; reason?: 'missing' | 'unavailable' | 'unreadable' }
@@ -3085,7 +3125,7 @@ export function MarketSection(props: MarketSectionProps) {
    * "npm latest" beside a number that is not npm's latest is a bug report
    * waiting to be filed. Null until the catalog answers.
    */
-  const [catalogUpdated, setCatalogUpdated] = useState<string | null>(null)
+  const catalogUpdated = data?.updated?.trim() || null
   const catalogVersionTip = useMemo(
     () => (catalogUpdated === null
       ? t('catalogVersionUndated')
@@ -3224,38 +3264,11 @@ export function MarketSection(props: MarketSectionProps) {
   const [sortField, setSortField] = useState<SortField>('downloads')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const [timeRange, setTimeRange] = useState<TimeRange>('all')
-  /** Undefined while the first catalog response is pending; null means the host cannot be located. */
-  const [hostVersion, setHostVersionState] = useState<string | null | undefined>(() => cachedHostVersion)
-  const setHostVersion = useCallback((value: string | null | undefined) => {
-    // Same process, different DSH — peer ranges were judged against the old
-    // host and must not keep filtering the list.
-    if (typeof cachedHostVersion === 'string' && typeof value === 'string' && value !== cachedHostVersion) {
-      clearHostCompatibilityCache()
-    }
-    cachedHostVersion = value
-    setHostVersionState(value)
-  }, [])
-  /** v1 is deliberately opt-in: undeclared/unknown entries stay visible even when enabled. */
-  // #872: ON by default. The report measured it on a live 0.2.0-rc.2 host —
-  // 175 discovered plugins, 45 of them declaring that host — so the default
-  // list was ~74% installable-in-name-only, with nothing at list level saying
-  // so. That is the wrong default per this project's own rule: the default has
-  // to be the one that is right without reading anything. Turning it off is
-  // one click in the filter menu, and the choice sticks.
-  const [compatibleWithHost, setCompatibleWithHostState] = useState(readHostFilterPreference)
-  const setCompatibleWithHost = useCallback((next: boolean) => {
-    setCompatibleWithHostState(next)
-    try { localStorage.setItem(HOST_FILTER_KEY, next ? 'compatible' : 'all') } catch { /* storage unavailable — the choice just won't survive a reload */ }
-  }, [])
+  const setCompatibleWithHost = useCallback((next: boolean) => { discoveryScan.setEnabled(next) }, [])
   /** The profile this page is running in, for the manual command's own
    * `--profile` token (#872). The catalog's is always `web`. */
   const [profileName, setProfileName] = useState<string | null>(null)
-  const hostCompatibility = useSyncExternalStore(
-    subscribeHostCompatibility,
-    () => cachedHostCompatibility,
-    () => cachedHostCompatibility,
-  )
-  const [hostCompatibilityPending, setHostCompatibilityPending] = useState(0)
+  const compatibilityDemandOwner = useRef({})
   const [catsOpen, setCatsOpen] = useState(false)
   /** Themes tab: independent from Discover's sort/time state above — a
    * search or sort choice in one tab has no business resetting the other. */
@@ -3317,15 +3330,63 @@ export function MarketSection(props: MarketSectionProps) {
   /** True while the drain is executing one queued request (no parallel starts). */
   const drainingRef = useRef(false)
 
-  const refreshInstalled = useCallback((force?: boolean) => {
-    fetch(api('/dsh-market/installed'), { cache: 'no-store' })
-      .then(res => res.json())
+  const mounted = useRef(false)
+  const refreshRequest = useRef(0)
+  const refreshInFlight = useRef(false)
+  const bridgedNotification = useRef<UpdateNotificationsState | null>(null)
+  const notificationReads = useRef(new Set<number>())
+  const [checkingUpdates, setCheckingUpdates] = useState(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      refreshRequest.current = 0
+      refreshInFlight.current = false
+      for (const request of notificationReads.current) releaseUpdateNotificationRead(request)
+      notificationReads.current.clear()
+    }
+  }, [])
+
+  const refreshInstalled = useCallback((force?: boolean, notification?: UpdateNotificationsState) => {
+    if (!mounted.current) return
+    const request = ++updateCheckRequest
+    const boot = updateCheckBoot
+    refreshRequest.current = request
+    refreshInFlight.current = true
+    if (notification === undefined) {
+      bridgedNotification.current = latestNotification.current
+      notificationReads.current.add(request)
+      pendingUpdateNotificationReads.add(request)
+    }
+    const ownsRefresh = () => mounted.current && refreshRequest.current === request
+    const isCurrent = () => ownsRefresh() && (boot === null || boot === updateCheckBoot)
+      && (notification === undefined || updateCheckBoot === null || notification.boot === updateCheckBoot)
+    setCheckingUpdates(true)
+    const requestOptions = { cache: 'no-store', signal: AbortSignal.timeout(UPDATE_CHECK_REQUEST_MS) } as const
+    const installRead = fetch(api('/dsh-market/installed'), requestOptions)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${String(res.status)}`)
+        return res.json()
+      })
       .then(body => {
-        setInstalled(body.installed || {})
+        if (!isCurrent() || !isInstalledSnapshot(body?.installed)) return null
+        const installed = body.installed
+        // Each surface renders its own installed list. A newer update check
+        // in a sibling surface can supersede the shared update response only.
+        if (request >= installedCheckCommitted) {
+          cachedInstalled = installed
+          installedCheckCommitted = request
+        }
+        setInstalledState(installed)
+        if (notification !== undefined) {
+          cachedInstalledReady = true
+          setInstalledReady(true)
+          return installed
+        }
         setLocalDescriptions(localDescriptionsFromUnknown(body.descriptions))
         setRepoIdentities(installedRepoIdentities(body.repoIdentities))
         setRepoHints(installedRepoHints(body.repoHints))
-        setInstalledFiles(Array.isArray(body.present) ? body.present : Object.keys(body.installed || {}))
+        setInstalledFiles(Array.isArray(body.present) ? body.present : Object.keys(installed))
         setSkins(body.live || [])
         if (Array.isArray(body.disabled)) {
           setDisabledNames(body.disabled)
@@ -3373,19 +3434,68 @@ export function MarketSection(props: MarketSectionProps) {
         installedReadGen.current += 1
         setHostDependencyFindings(findings)
         cachedInstalledReady = true
-        setQueueSnapshotReady(ready => ({ ...ready, installed: true }))
+        setInstalledReady(true)
+        return installed
       })
-      .catch(() => {})
-    fetch(api('/dsh-market/updates') + (force === true ? '?force=1' : ''), { cache: 'no-store' })
-      .then(res => res.json())
-      .then(body => {
-        setUpdates(body.updates || {})
-        void refreshUpdateNotifications()
-        cachedUpdatesReady = true
-        setQueueSnapshotReady(ready => ({ ...ready, updates: true }))
+      .catch(() => null)
+    const updateRead = notification !== undefined
+      ? Promise.resolve(notification.updates)
+      : fetch(api('/dsh-market/updates') + (force === true ? '?force=1' : ''), requestOptions)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${String(res.status)}`)
+        return res.json()
       })
-      .catch(() => {})
-  }, [setActivations, setBlockedNames, setDisabledNames, setFavoriteUrls, setInstalledBundles, setInstalledFiles, setLocalDescriptions, setSkins, setUpdates])
+      .then(readUpdateStatuses)
+      .catch(() => {
+        // Expose a failed update check even when /installed is still loading.
+        // Reconcile any retained entries when that read has settled.
+        if (isCurrent()) applyUpdateCheck(request, null, null)
+        if (ownsRefresh()) { refreshInFlight.current = false; setCheckingUpdates(false) }
+        return null
+      })
+    void Promise.all([updateRead, installRead]).then(([received, installed]) => {
+      if (isCurrent()) {
+        if (notification?.checkedAt === null && request >= updateCheckCommitted) {
+          updateCheckCommitted = request
+          publishUpdateCheck({ ...emptyUpdateCheck, installed: installed ?? {} })
+        } else {
+          applyUpdateCheck(request, received, installed)
+          // A partial failure still carries successful results for other
+          // packages. Only an unclassified failure makes the whole check unknown.
+          if (notification?.error != null && request === updateCheckCommitted
+            && updateCheckSnapshot.failed?.size === 0) {
+            publishUpdateCheck({ ...updateCheckSnapshot, failed: null })
+          }
+        }
+      }
+      if (notification === undefined) {
+        const release = () => {
+          notificationReads.current.delete(request)
+          releaseUpdateNotificationRead(request)
+        }
+        // A sample received during this check predates its result. Keep both
+        // surfaces fenced until a trailing local read has passed any older GET.
+        if (ownsRefresh()) void refreshUpdateNotificationsAfterChange().finally(release)
+        else release()
+      }
+      if (ownsRefresh()) { refreshInFlight.current = false; setCheckingUpdates(false) }
+    })
+  }, [setActivations, setBlockedNames, setDisabledNames, setFavoriteUrls, setInstalledBundles, setInstalledFiles, setLocalDescriptions, setSkins])
+
+  // A background result reuses the shared update snapshot, but still pairs it
+  // with a fresh local inventory before restoring queued work. This reads no
+  // update source and never starts a second scheduler. Manual checks keep their
+  // request/boot fences and finish before a background sample is considered.
+  useEffect(() => {
+    if (!notificationSnapshot.loaded || notificationSnapshot.readFailed || notificationSnapshot.checking
+      || refreshInFlight.current || pendingUpdateNotificationReads.size > 0
+      || (updateCheckBoot !== null && notificationSnapshot.boot !== updateCheckBoot)) return
+    const previous = bridgedNotification.current
+    if (previous?.updates === notificationSnapshot.updates && previous.checkedAt === notificationSnapshot.checkedAt
+      && previous.error === notificationSnapshot.error && previous.boot === notificationSnapshot.boot) return
+    bridgedNotification.current = notificationSnapshot
+    refreshInstalled(undefined, notificationSnapshot)
+  }, [notificationSnapshot, checkingUpdates, updateCheck, refreshInstalled])
 
   /**
    * Host-owned deferred operations (#411).
@@ -3663,6 +3773,9 @@ export function MarketSection(props: MarketSectionProps) {
    * with the user left to guess whether the plugin landed.
    */
   const noteMarketGone = useCallback(() => {
+    discoveryScan.setUnavailable()
+    refreshRequest.current = 0
+    setCheckingUpdates(false)
     setMarketGone(true)
     setBusyUrl(null)
     setUpdatingName(null)
@@ -3676,6 +3789,9 @@ export function MarketSection(props: MarketSectionProps) {
       sessionStorage.removeItem('dshm-updating')
     } catch { /* storage unavailable */ }
   }, [t])
+  useEffect(() => {
+    if (compatibility.gone) noteMarketGone()
+  }, [compatibility.gone, noteMarketGone])
 
   /**
    * The status payload, or `null` when the route answered 404 (#962). Every
@@ -3692,31 +3808,12 @@ export function MarketSection(props: MarketSectionProps) {
 
   const loadCatalog = useCallback(() => {
     setLoadError(null)
-    return fetch(api('/dsh-market/registry'), { cache: 'no-store' })
-      .then(async (res) => {
-        const body = (await res.json().catch(() => ({}))) as {
-          registry?: Registry
-          hostVersion?: string | null
-          error?: string
-        }
-        if (res.status === 404) {
+    return discoveryScan.resume()
+      .then((outcome) => {
+        if (outcome === 'gone') {
           noteMarketGone()
           throw new Error(t('marketGoneTitle'))
         }
-        if (!res.ok) throw new Error(typeof body.error === 'string' ? body.error : `HTTP ${String(res.status)}`)
-        return body
-      })
-      .then((body) => {
-        if (body.registry === undefined) throw new Error('the catalog response carried no data')
-        if (body.registry.updated !== cachedRegistry?.updated) {
-          resetScreenshotsCache()
-          resetThemePreviewCache()
-        }
-        cachedRegistry = body.registry
-        setData(body.registry)
-        const catalogDate = body.registry.updated
-        setCatalogUpdated(typeof catalogDate === 'string' && catalogDate.trim() !== '' ? catalogDate : null)
-        setHostVersion(typeof body.hostVersion === 'string' ? body.hostVersion : null)
         setLoadError(null)
       })
       // Report WHY. An unreachable catalog used to be answered with a
@@ -3745,12 +3842,15 @@ export function MarketSection(props: MarketSectionProps) {
     let inFlight: AbortController | undefined
     let stopped = false
     const attempt = async (): Promise<void> => {
+      const boot = updateCheckBoot
       inFlight = new AbortController()
       const cutoff = setTimeout(() => inFlight?.abort(), RECONNECT_REQUEST_MS)
       try {
         const res = await fetch(api('/dsh-market/status'), { cache: 'no-store', signal: inFlight.signal })
         const status = res.ok ? await res.json() as Partial<MarketStatus> | null : null
         if (!stopped && status !== null && typeof status === 'object' && typeof status.boot === 'string') {
+          discoveryScan.setBoot(status.boot)
+          observeUpdateCheckBoot(status.boot, boot)
           setMarketGone(false)
           void loadCatalog()
           refreshInstalled()
@@ -3775,61 +3875,9 @@ export function MarketSection(props: MarketSectionProps) {
     }
   }, [marketGone, reconnectRound, loadCatalog, refreshInstalled])
 
-  const loadHostCompatibility = useCallback(async (names: readonly string[]): Promise<void> => {
-    const unique = [...new Set(names)].filter(name => {
-      if (name === '' || hostCompatibilitySettled(name) || hostCompatibilityInFlight.has(name)) return false
-      hostCompatibilityInFlight.add(name)
-      return true
-    })
-    if (unique.length === 0) return
-    setHostCompatibilityPending(count => count + unique.length)
-    for (let offset = 0; offset < unique.length; offset += 64) {
-      const chunk = unique.slice(offset, offset + 64)
-      try {
-        const response = await fetch(api('/dsh-market/discovery-compatibility'), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            packages: chunk.filter(key => !key.startsWith('https://')),
-            ...(chunk.some(key => key.startsWith('https://'))
-              ? { entries: chunk.filter(key => key.startsWith('https://')) } : {}),
-          }),
-        })
-        const body = await response.json() as {
-          hostVersion?: string | null
-          plugins?: Record<string, HostCompatibility>
-        }
-        if (!response.ok || body.plugins === null || typeof body.plugins !== 'object') {
-          throw new Error(`HTTP ${String(response.status)}`)
-        }
-        if (typeof body.hostVersion === 'string' || body.hostVersion === null) {
-          setHostVersion(body.hostVersion)
-        }
-        const accepted: HostCompatibilityMap = {}
-        for (const name of chunk) {
-          const item = body.plugins[name] as HostCompatibility | null | undefined
-          if (item === null || item === undefined
-            || !['compatible', 'incompatible', 'unknown'].includes(item.status)
-            || !['manifest', 'undeclared', 'unavailable'].includes(item.basis)
-            || (item.requirement !== null && typeof item.requirement !== 'string')
-            || !Array.isArray(item.declarations)) {
-            accepted[name] = UNAVAILABLE_HOST_COMPATIBILITY
-            continue
-          }
-          accepted[name] = item
-        }
-        commitHostCompatibility(accepted)
-      } catch {
-        commitHostCompatibility(Object.fromEntries(chunk.map(name => [name, UNAVAILABLE_HOST_COMPATIBILITY])))
-      } finally {
-        for (const name of chunk) hostCompatibilityInFlight.delete(name)
-        setHostCompatibilityPending(count => Math.max(0, count - chunk.length))
-      }
-    }
-  }, [setHostVersion])
-
   useEffect(() => {
     void loadCatalog()
+    const boot = updateCheckBoot
     fetch(api('/dsh-market/status'), { cache: 'no-store' })
       .then(readMarketStatus)
       .then(status => {
@@ -3849,6 +3897,8 @@ export function MarketSection(props: MarketSectionProps) {
         // within seconds and the images correct themselves.
         applyGithubRouting(status)
         if (typeof status.boot === 'string') {
+          discoveryScan.setBoot(status.boot)
+          if (mounted.current && observeUpdateCheckBoot(status.boot, boot)) refreshInstalled()
           setBootId(status.boot)
           setIgnoredUpdateNames(ignoredUpdatesForBoot(status.boot))
           // A dismissal only silences the notice for the boot it was made
@@ -4374,15 +4424,20 @@ export function MarketSection(props: MarketSectionProps) {
   // Host filter, applied to the already-blocked list: the same rows
   // `visiblePlugins` dropped, and the same count the chip reports, at a cost
   // that does not grow with the catalog.
-  const { plugins, hostHiddenCount } = useMemo(() => {
-    if (!compatibleWithHost) return { plugins: pluginsUnblocked, hostHiddenCount: 0 }
+  const { plugins, hostHiddenCount, hostUnavailableCount } = useMemo(() => {
+    if (!compatibleWithHost) return { plugins: pluginsUnblocked, hostHiddenCount: 0, hostUnavailableCount: 0 }
     const compatible = (plugin: RegistryPlugin): boolean => {
       const key = hostCompatibilityKey(plugin)
       return key === null || hostCompatibility[key]?.status !== 'incompatible'
     }
     let hidden = 0
     for (const plugin of pluginsAll) if (!compatible(plugin)) hidden += 1
-    return { plugins: pluginsUnblocked.filter(compatible), hostHiddenCount: hidden }
+    let unavailable = 0
+    for (const plugin of pluginsUnblocked) {
+      const key = hostCompatibilityKey(plugin)
+      if (key !== null && hostCompatibility[key]?.basis === 'unavailable') unavailable += 1
+    }
+    return { plugins: pluginsUnblocked.filter(compatible), hostHiddenCount: hidden, hostUnavailableCount: unavailable }
   }, [pluginsAll, pluginsUnblocked, compatibleWithHost, hostCompatibility])
   // A sort the user chose is a request to see the list in THAT order, and
   // this block ignores the sort by design (it is "what was added in the last
@@ -4429,28 +4484,6 @@ export function MarketSection(props: MarketSectionProps) {
   const pagePlugins = surface === 'plugins'
     ? plugins.slice(0, discoverMore.shown)
     : plugins.slice((currentPage - 1) * pageSize, currentPage * pageSize)
-  const pageHostPackages = [...new Set([...pagePlugins, ...recentPlugins].flatMap(plugin =>
-    hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)!]))]
-  const allHostPackages = useMemo(
-    () => [...new Set((data?.plugins ?? []).flatMap(plugin =>
-      hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)!]))],
-    [data],
-  )
-  const pageHostPackagesKey = pageHostPackages.join('\u0000')
-  const allHostPackagesKey = allHostPackages.join('\u0000')
-  useEffect(() => {
-    if (tab === 'discover') void loadHostCompatibility(pageHostPackages)
-    // The key is the stable identity of this page's package/source set; the
-    // array itself is recreated as compatibility results arrive.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, pageHostPackagesKey, loadHostCompatibility])
-  useEffect(() => {
-    if (compatibleWithHost) void loadHostCompatibility(allHostPackages)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [compatibleWithHost, allHostPackagesKey, loadHostCompatibility])
-  const loadedHostPackages = allHostPackages.reduce(
-    (count, name) => count + (hostCompatibility[name] === undefined ? 0 : 1), 0,
-  )
 
   const themePluginsAll = useMemo(
     () => (data === null ? [] : visiblePlugins(data.plugins, {
@@ -4516,13 +4549,17 @@ export function MarketSection(props: MarketSectionProps) {
   // Favorites reuse pluginCard (and its host-requirement badge). Discover
   // already loads compatibility for the current page; without the same
   // fetch here the badge stays on "Reading host requirement…" forever.
-  const favoritePageHostPackages = [...new Set(favoritePagePlugins.flatMap(plugin =>
-    hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)!]))]
-  const favoritePageHostPackagesKey = favoritePageHostPackages.join('\u0000')
+  const compatibilityCards = marketGone ? [] : tab === 'discover'
+    ? [...pagePlugins, ...(!recentHidden && !recentCollapsed ? recentPlugins : [])]
+    : tab === 'favorites' ? favoritePagePlugins : []
+  const compatibilityKeys = compatibilityCards.map(hostCompatibilityKey).filter(key => key !== null).join('\u0000')
   useEffect(() => {
-    if (tab === 'favorites') void loadHostCompatibility(favoritePageHostPackages)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, favoritePageHostPackagesKey, loadHostCompatibility])
+    discoveryScan.setDemand(compatibilityDemandOwner.current, compatibilityKeys === '' ? [] : compatibilityKeys.split('\u0000'))
+  }, [compatibilityKeys])
+  useEffect(() => {
+    const owner = compatibilityDemandOwner.current
+    return () => { discoveryScan.removeDemand(owner) }
+  }, [])
   const favoriteStale = useMemo(
     () => (data === null ? [] : staleFavoriteUrls(favoriteUrls, data.plugins)),
     [data, favoriteUrls])
@@ -7561,6 +7598,7 @@ export function MarketSection(props: MarketSectionProps) {
       onClick={doExportLog}
     >{exportState === 'busy' ? t('exportingLog') : t('exportLog')}</Button>
   )
+  const updateCheckFailed = updateCheck.failed === null || updateCheck.failed.size > 0
 
   return (
     <div
@@ -7707,6 +7745,18 @@ export function MarketSection(props: MarketSectionProps) {
             }}
           />
         </div>
+        {!marketGone && updateCheckFailed && (
+          <div className={css.updateCheckNotice}>
+            <span role="status">{t('updateCheckFailed')}</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={t('updateCheckRetry')}
+              disabled={checkingUpdates}
+              onClick={() => refreshInstalled(true)}
+            >{t('loadRetry')}</Button>
+          </div>
+        )}
         {/* Backup & Restore and Diagnostics sit under Advanced rather than as
             their own top-level tabs — most users never need either, and having
             five peers up top buried the ones people actually reach for. */}
@@ -8230,13 +8280,14 @@ export function MarketSection(props: MarketSectionProps) {
                       </div>
                       {compatibleWithHost && typeof hostVersion === 'string' && (
                         <div className={css.hostFilterNote}>
-                          {hostCompatibilityPending > 0 || loadedHostPackages < allHostPackages.length
+                          {compatibility.scanning
                             ? t('hostFilterLoading')
-                              .replace('{0}', String(loadedHostPackages))
-                              .replace('{1}', String(allHostPackages.length))
-                            : t('hostFilterActive')
+                              .replace('{0}', String(compatibility.attempted))
+                              .replace('{1}', String(compatibility.total))
+                            : t(hostUnavailableCount > 0 ? 'hostFilterIncomplete' : 'hostFilterActive')
                                 .replace('{0}', hostVersion)
-                                .replace('{1}', String(hostHiddenCount))}
+                                .replace('{1}', String(hostHiddenCount))
+                                .replace('{2}', String(hostUnavailableCount))}
                         </div>
                       )}
                     </div>
@@ -9234,7 +9285,9 @@ export function MarketSection(props: MarketSectionProps) {
                                                     >{t('install')}</Button>
                                                   </>
                                                 )
-                                              : <span className={css.metaTag} title={t('upToDate')}>{t('upToDate')}</span>}
+                                              : updateCheck.failed === null || updateCheck.failed.has(name)
+                                                ? null
+                                                : <span className={css.metaTag} title={t('upToDate')}>{t('upToDate')}</span>}
                                 {removingName === name && <span className={css.metaTag}>{t('uninstalling')}</span>}
                                 </span>
                                 </div>
@@ -9803,6 +9856,26 @@ export function MarketSection(props: MarketSectionProps) {
                     stripped first; headings, quotes, fences, bullets, bold,
                     inline code, https links and allowlisted images only. */}
                 <div className={css.notesRendered}>{renderMarkdown(updateNotes.release.body || t('notesNone'))}</div>
+                {updateNotes.commits !== undefined && updateNotes.commits.items.length > 0 && (
+                  <>
+                    <div className={css.notesMeta}><strong>{t('notesCommits')}</strong></div>
+                    {!updateNotes.commits.found && <div className={css.notesMeta}>{t('notesCommitsRecent')}</div>}
+                    <ul className={css.notesList}>
+                      {updateNotes.commits.items.map(c => (
+                        <li key={c.sha} className={css.notesRow}>
+                          <span className={css.notesDate}>{c.date !== null ? c.date.slice(0, 10) : ''}</span>
+                          <span className={css.notesMsg}>{mdInline(c.message)}</span>
+                          {notesFor.repoUrl !== null && (
+                            <a className={css.notesSha}
+                              href={notesFor.repoUrl + '/commit/' + c.sha}
+                              target="_blank" rel="noreferrer"
+                              title={c.message}>{c.sha.slice(0, 7)}</a>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
               </div>
             )
             : updateNotes.kind === 'commits' ? (

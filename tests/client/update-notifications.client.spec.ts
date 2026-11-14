@@ -19,7 +19,7 @@ afterEach(() => { vi.restoreAllMocks(); sessionStorage.clear(); localStorage.cle
 describe('shared update notification snapshot', () => {
   it('starts with automatic checks off and a six-hour interval', () => {
     const store = createUpdateNotificationsStore(vi.fn())
-    expect(store.getSnapshot()).toMatchObject({ enabled: false, intervalHours: 6, loaded: false })
+    expect(store.getSnapshot()).toMatchObject({ enabled: false, intervalHours: 6, loaded: false, readFailed: false })
   })
 
   it.each([6, 12, 72, 168] as const)('saves the %s-hour interval without enabling checks', async intervalHours => {
@@ -94,13 +94,16 @@ describe('shared update notification snapshot', () => {
       .mockRejectedValueOnce(new TypeError('offline'))
       .mockResolvedValueOnce(response({ ok: true }))
       .mockResolvedValueOnce(response(snapshot({ updates: { alpha: { kind: 'generation', latest: 42 } as never } })))
+      .mockResolvedValueOnce(response(snapshot({ updates: { alpha: { updateAvailable: false, checkFailed: false } as never } })))
+      .mockResolvedValueOnce(response(snapshot({ error: 'One source failed', stale: true, updates: { alpha: { updateAvailable: true, checkFailed: true } } })))
     const store = createUpdateNotificationsStore(request)
     await store.refresh()
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await expect(store.refresh()).resolves.toMatchObject({ stale: true, loaded: true })
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await expect(store.refresh()).resolves.toMatchObject({ stale: true, loaded: true, readFailed: true })
       expect(notificationNames(store.getSnapshot())).toEqual(['alpha'])
       expect(store.getSnapshot().lastSuccessAt).toBe(100)
     }
+    await expect(store.refresh()).resolves.toMatchObject({ loaded: true, readFailed: false, stale: true, error: 'One source failed' })
   })
 
   it('posts only explicit checks/settings and ignores an older GET arriving after a save', async () => {

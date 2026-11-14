@@ -15,7 +15,7 @@ import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { load as loadYaml } from 'js-yaml'
 import { packageFileFromRegistry } from './catalog-npm.ts'
-import { forgetCatalog, loadRegistry, pluginCategories } from './registry.ts'
+import { forgetCatalog, loadRegistry, pluginCategories, type Registry, type RegistryPlugin } from './registry.ts'
 import { settingsNamespaceState } from './settings.ts'
 import {
   buildEnvFromUnknown, cleanHotDir, forgetInstalled, hotMount, hotUnmount, listHotMounts, MAX_BLOCKED, MAX_BLOCKED_NAME, MAX_FAVORITES, MAX_NOTE, MAX_UPDATE_EXEMPT,
@@ -24,7 +24,7 @@ import {
 } from './hot.ts'
 import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
 import { dshHostInfo, findDshInstallDir } from './dsh-install.ts'
-import { catalogReleaseManifest, deriveHostCompatibility, DiscoveryManifestIndex, findCompatibleVersion } from './discovery-compatibility.ts'
+import { catalogReleaseManifest, deriveHostCompatibility, DiscoveryManifestIndex, findCompatibleVersion, githubCompatibilityRevision, type HostCompatibility } from './discovery-compatibility.ts'
 import { configurePersistentLog, exportLogs, logEvent, readPersistentLog } from './log.ts'
 import { marketFetch } from './net.ts'
 import { catalogReleaseSourceOf, publishedReleaseUpdate, type CatalogReleaseSource } from './release-updates.ts'
@@ -59,7 +59,7 @@ import { resolveRegion } from './region-probe.ts'
 import { acceleratedTarget, resolveHeadCommit } from './accelerate.ts'
 import { sourceWebUrl, updateNotesFor } from './changelog.ts'
 import { checkUpdates, isUpdatablePlugin, compareVersions, fetchNpmLatest, invalidateUpdates, readVersionMaturity, resolveDesktopMatureUpdate, resolveGitRemoteHead, isUpgrade, latestPublishedRecently, setUpdateRegistry, versionOnChannel } from './updates.ts'
-import { isStableReleaseVersion } from './release-candidates.ts'
+import { isExactReleaseVersion, isStableReleaseVersion } from './release-candidates.ts'
 import { createUpdateNotificationMonitor } from './update-notifications.ts'
 import { DEFAULT_UPDATE_CHECK_INTERVAL_HOURS, isUpdateCheckIntervalHours } from './update-notification-settings.ts'
 import { createThemeManager, type LoaderEntry } from './themes.ts'
@@ -84,6 +84,50 @@ import { declaredPredecessors, findCatalogRename, findGitToNpmMigration, findNpm
 
 export type { LoaderEntry } from './themes.ts'
 export type { UpdateStatus } from './updates.ts'
+
+const DISCOVERY_RETRY_MS = 30_000
+
+type DiscoveryVerdict = HostCompatibility & { retryAfterMs?: number; catalogChanged?: true }
+type DiscoveryPlugin = RegistryPlugin & { compatibilityRevision?: string }
+type DiscoveryCatalog = Omit<Registry, 'plugins'> & { plugins: DiscoveryPlugin[] }
+
+/** These revisions describe the server's catalog, independently of what its source includes. */
+const discoveryCatalogs = new WeakMap<Registry, {
+  revisions: Map<string, { entry: RegistryPlugin; revision: string }>
+  response: DiscoveryCatalog
+}>()
+
+function discoveryCatalog(registry: Registry) {
+  const previous = discoveryCatalogs.get(registry)
+  if (previous !== undefined) return previous
+  const revisions = new Map<string, { entry: RegistryPlugin; revision: string }>()
+  const plugins = registry.plugins.map((entry): DiscoveryPlugin => {
+    if ((entry.npm == null || entry.npm === '') && typeof entry.url === 'string' && parseSourceUrl(entry.url) !== null) {
+      const revision = githubCompatibilityRevision(entry)
+      revisions.set(entry.url, { entry, revision })
+      return { ...entry, compatibilityRevision: revision }
+    }
+    if (!Object.hasOwn(entry, 'compatibilityRevision')) return entry
+    const { compatibilityRevision: _sourceRevision, ...plugin } = entry as DiscoveryPlugin
+    return plugin
+  })
+  const snapshot = { revisions, response: { ...registry, plugins } }
+  discoveryCatalogs.set(registry, snapshot)
+  return snapshot
+}
+
+function discoveryHints(
+  value: unknown, requested: ReadonlySet<string>, validValue: (hint: unknown) => hint is string,
+): Map<string, string> | null {
+  if (value === undefined) return new Map()
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const hints = new Map<string, string>()
+  for (const [key, hint] of Object.entries(value)) {
+    if (!requested.has(key) || !validValue(hint)) return null
+    hints.set(key, hint)
+  }
+  return hints
+}
 
 /**
  * Recognize the documented GitHub Release-download target shape. This does
@@ -830,7 +874,7 @@ export function mountMarketRoutes(
    *   dropped from the market's disable list.
    */
   function followOutsideEnable(name: string): boolean {
-    const patch = readUserPatchState(userPatchPath)
+    const patch = readUserPatchState(userPatchPath, rowId => composedRowName(host, rowId))
     const flags = packagePatchFlags(host, activeProfileDir, [name], patch)
     if (!flags.forced.includes(name) || flags.disabled.includes(name)) return false
     disabled.delete(name)
@@ -1182,10 +1226,14 @@ export function mountMarketRoutes(
    * every time), and a group "off" wrote no patch row — the official page and
    * the market disagreed again, one control over (@snmtg1008, #696).
    *
-   * @param liveOk - whether the live switch succeeded; a failed ENABLE writes
+   * @param switchLive - perform the runtime switch; a failed ENABLE writes
    *   neither layer (#575).
    */
-  async function switchPluginLayers(name: string, enabled: boolean, liveOk: boolean, liveReason: string | undefined): Promise<{
+  async function switchPluginLayers(
+    name: string,
+    enabled: boolean,
+    switchLive = () => setPluginEnabled(name, enabled),
+  ): Promise<{
     ok: boolean
     reason: string | undefined
     patchRows: string[]
@@ -1197,6 +1245,15 @@ export function mountMarketRoutes(
     isCarrier: boolean
     bundleSwitch: { ok: boolean; reason: string | null }
   }> {
+    const packageDir = join(activeProfileDir, 'node_modules', name)
+    // Capture module identity before switching the entry off.
+    const namedRows = new Set<string>()
+    if (!enabled) {
+      for (const id of shippedInsertedRowIds(packageDir)) {
+        if (composedRowName(host, id) === name) namedRows.add(id)
+      }
+    }
+    const { ok: liveOk, reason: liveReason } = await switchLive()
     let ok = liveOk
     let reason = liveReason
     // Durable patch-layer write (port of dsh-plugin-hub): the package's
@@ -1213,12 +1270,12 @@ export function mountMarketRoutes(
     // side effect of a bug fix. Skipped only while something else is left to
     // flip: a package whose rows are ALL opt-in rows still has to be
     // switchable.
-    const optOutRows = new Set(bundleOptOutRowIds(join(activeProfileDir, 'node_modules', name)))
+    const optOutRows = new Set(bundleOptOutRowIds(packageDir))
     // Rows the bundle decides itself, by expression (`disabled: !!js …`),
     // are a third shape next to opt-in rows: the market can neither read
     // nor overrule the condition, so enabling the package must leave them
     // exactly as the bundle ships them (#1043).
-    const expressionRows = new Set(bundleExpressionRowIds(join(activeProfileDir, 'node_modules', name)))
+    const expressionRows = new Set(bundleExpressionRowIds(packageDir))
     const decided = patchRows.filter(rowId => !optOutRows.has(rowId))
     /** Rows that can carry a USER decision about this package — see above. */
     const userRows = decided.length > 0 ? decided : patchRows
@@ -1300,7 +1357,7 @@ export function mountMarketRoutes(
     // The name the loader composed for a row, for the rows whose user-layer
     // entry carries one of its own: the host skips an entry whose `name` is
     // not this one, so its flag is not a decision about the row (#1113).
-    const expectedNameFor = (rowId: string): string | null => composedRowName(host, rowId)
+    const expectedNameFor = (rowId: string): string | null => namedRows.has(rowId) ? name : composedRowName(host, rowId)
     /** A user-layer flag counts only when the row it names is this entry. */
     const rowIsOurs = (rowId: string): boolean => prePatch !== null && rowFlagApplies(prePatch, rowId, expectedNameFor(rowId))
     if (patchRows.length > 0 && patchGate && prePatch !== null) {
@@ -1319,7 +1376,7 @@ export function mountMarketRoutes(
       const targets = enabled
         ? patchRows.filter(rowId => (!optOutRows.has(rowId) && !expressionRows.has(rowId)) || (rowIsOurs(rowId) && prePatch.disables.includes(rowId)))
         : patchRows
-      const flipped: string[] = []
+      const flipped: { rowId: string; removedMarketName?: string }[] = []
       for (const rowId of targets) {
         // #1110: an opt-in or expression row that the user's layer still holds
         // closed can only be CLEANED here. `enableRow`'s force-enable appends
@@ -1328,11 +1385,15 @@ export function mountMarketRoutes(
         // on that #876/#1043 say must never be forced on.
         const cleanOnly = optOutRows.has(rowId) || expressionRows.has(rowId)
         const expectedName = expectedNameFor(rowId)
-        const result = enabled
-          ? await enableRow(userPatchPath, rowId, { cleanOnly, expectedName })
-          : await disableRow(userPatchPath, rowId, { expectedName })
+        // DSH drops a simple id/disabled override when enabling would restore
+        // the bundle default. An exact module name keeps the user's enable
+        // in the shared patch layer for followOutsideEnable (#1196).
+        const recordModuleName = stackToggle && !isCarrier && !cleanOnly && namedRows.has(rowId)
+        const result: Awaited<ReturnType<typeof enableRow>> = enabled
+          ? await enableRow(userPatchPath, rowId, { cleanOnly, expectedName, packageName: name })
+          : await disableRow(userPatchPath, rowId, { expectedName, recordModuleName, packageName: name })
         if (result.ok) {
-          flipped.push(rowId)
+          flipped.push({ rowId, removedMarketName: result.removedMarketName })
           continue
         }
         patchWrite = result
@@ -1348,19 +1409,21 @@ export function mountMarketRoutes(
         // disable direction keeps what it got, because a row the patch
         // layer refuses to flip does not make the plugin live again.
         if (enabled) {
-          for (const rowId of flipped) {
+          for (const { rowId, removedMarketName } of flipped) {
             // A row that was disabled gets its block back; a row that was
             // not loses the block this enable added. Leaving a
             // `disabled: false` behind would force-enable it in the
             // user's own patch layer — the same disagreement this route
             // exists to end, one row smaller.
-            if (prePatch !== null && rowIsOurs(rowId) && prePatch.disables.includes(rowId)) {
-              const back = await disableRow(userPatchPath, rowId, { expectedName: expectedNameFor(rowId) })
+            if (removedMarketName !== undefined || (rowIsOurs(rowId) && prePatch.disables.includes(rowId))) {
+              const expectedName = removedMarketName ?? expectedNameFor(rowId)
+              const recordModuleName = removedMarketName !== undefined
+              const back = await disableRow(userPatchPath, rowId, { expectedName, recordModuleName, packageName: name })
               if (!back.ok) logEvent('warn', 'toggle', `${name}: patch row ${rowId} could not be put back — ${back.reason}`)
             } else if (prePatch === null || !rowIsOurs(rowId) || !prePatch.forced.includes(rowId)) {
               // A row already forced on before this call got nothing from
               // the enable; that block is the user's to keep.
-              const cleanedRow = removeRowBlocks(userPatchPath, [rowId])
+              const cleanedRow = removeRowBlocks(userPatchPath, [rowId], name)
               if (!cleanedRow.ok) logEvent('warn', 'toggle', `patch row could not be cleared — ${cleanedRow.reason}`)
             }
           }
@@ -2063,7 +2126,7 @@ export function mountMarketRoutes(
     if (native) {
       logEvent('info', 'uninstall', `${name} ships or depends on a native addon; a restart is needed before it can be installed again`)
     }
-    const cleanedOwned = removeRowBlocks(userPatchPath, ownedRows)
+    const cleanedOwned = removeRowBlocks(userPatchPath, ownedRows, name)
     if (!cleanedOwned.ok) logEvent('warn', 'uninstall', `patch rows could not be cleared — ${cleanedOwned.reason}`)
     else rowJournal.finish(config.profile, name)
     disabled.delete(name)
@@ -2672,7 +2735,7 @@ export function mountMarketRoutes(
         const sourceMigration = sourceMigrationFor.get(name)
         updates[name] = { ...status,
           ...(sourceMigration === undefined ? {} : { sourceMigration }),
-          ...(lookupFailed ? { checkError: 'unavailable' as const } : {}),
+          ...(lookupFailed ? { checkFailed: true as const, checkError: 'unavailable' as const } : {}),
         }
       }
       return { updates, ...(lookupFailed ? { error: 'Plugin sources could not be checked. Try again later.' } : {}) }
@@ -3427,7 +3490,7 @@ export function mountMarketRoutes(
           try {
             const registry = await loadRegistry()
             sendJson(response, 200, {
-              registry,
+              registry: discoveryCatalog(registry).response,
               hostVersion: dshHostInfo()?.version ?? null,
             })
           } catch (error) {
@@ -3511,32 +3574,62 @@ export function mountMarketRoutes(
           sendJson(response, 400, { error: 'entries must be GitHub catalog URLs; at most 64 packages and entries per batch' })
           return
         }
-        const packages = [...new Set(requested as string[])]
+        const packages = new Set(requested as string[])
+        const urls = new Set(requestedEntries as string[])
+        const versions = discoveryHints((body as { versions?: unknown }).versions, packages, isExactReleaseVersion)
+        const revisions = discoveryHints((body as { githubRevisions?: unknown }).githubRevisions, urls,
+          (hint): hint is string => typeof hint === 'string' && hint.length === 64 && /^[a-f0-9]+$/.test(hint))
+        if (versions === null || revisions === null) {
+          sendJson(response, 400, { error: 'versions and githubRevisions must match entries in the current batch' })
+          return
+        }
         try {
-          const urls = new Set(requestedEntries as string[])
-          const entries = urls.size === 0 ? [] : (await loadRegistry()).plugins.filter(entry =>
-            urls.has(entry.url) && (entry.npm == null || entry.npm === ''))
-          if (new Set(entries.map(entry => entry.url)).size !== urls.size) {
-            sendJson(response, 400, { error: 'entries must name GitHub-only plugins in the current catalog' })
-            return
-          }
           const host = dshHostInfo()
           const hostVersion = host?.version ?? null
           const hostPackages = corePackageNames(host?.directory ?? null)
-          const catalogFacts = Object.fromEntries(entries.flatMap(entry => {
-            const facts = catalogReleaseManifest(entry)
-            return facts === null ? [] : [[entry.url, facts]]
-          }))
-          const [npmFacts, githubFacts] = await Promise.all([
-            discoveryManifests.lookup(packages, routesFor(region).npmRegistry),
-            githubDiscoveryManifests.lookupGitHub(entries.filter(entry => catalogFacts[entry.url] === undefined)),
+          const npmRegistry = routesFor(region).npmRegistry
+          const githubVerdicts = async (): Promise<Record<string, DiscoveryVerdict>> => {
+            if (urls.size === 0) return {}
+            const unavailable = deriveHostCompatibility(null, hostVersion, hostPackages)
+            const catalog = await loadRegistry().then(discoveryCatalog).catch(() => null)
+            if (catalog === null) {
+              return Object.fromEntries([...urls].map(url => [url, { ...unavailable, retryAfterMs: DISCOVERY_RETRY_MS }]))
+            }
+            const results: Record<string, DiscoveryVerdict> = {}
+            const fetchEntries: RegistryPlugin[] = []
+            for (const url of urls) {
+              const match = catalog.revisions.get(url)
+              const expected = revisions.get(url)
+              if (match === undefined || (expected !== undefined && expected !== match.revision)) {
+                results[url] = { ...unavailable, catalogChanged: true }
+                continue
+              }
+              const facts = catalogReleaseManifest(match.entry)
+              if (facts === null) fetchEntries.push(match.entry)
+              else results[url] = deriveHostCompatibility(facts, hostVersion, hostPackages)
+            }
+            if (fetchEntries.length === 0) return results
+            const factsByUrl = await githubDiscoveryManifests.lookupGitHub(fetchEntries)
+            for (const entry of fetchEntries) {
+              const facts = factsByUrl[entry.url] ?? null
+              results[entry.url] = facts === null ? { ...unavailable,
+                retryAfterMs: githubDiscoveryManifests.githubRetryAfterMs(entry) || DISCOVERY_RETRY_MS,
+              } : deriveHostCompatibility(facts, hostVersion, hostPackages)
+            }
+            return results
+          }
+          const [npmFacts, githubPlugins] = await Promise.all([
+            discoveryManifests.lookup([...packages], npmRegistry, { versions }),
+            githubVerdicts(),
           ])
-          const facts = { ...npmFacts, ...githubFacts, ...catalogFacts }
-          const plugins = Object.fromEntries([...packages, ...urls].map(name => [
-            name,
-            deriveHostCompatibility(facts[name] ?? null, hostVersion, hostPackages),
-          ]))
-          sendJson(response, 200, { hostVersion, plugins })
+          const npmPlugins = Object.fromEntries<DiscoveryVerdict>([...packages].map(name => {
+            const facts = npmFacts[name] ?? null
+            const verdict = deriveHostCompatibility(facts, hostVersion, hostPackages)
+            return [name, facts === null ? { ...verdict,
+              retryAfterMs: discoveryManifests.npmRetryAfterMs(name, npmRegistry, versions.get(name)) || DISCOVERY_RETRY_MS,
+            } : verdict]
+          }))
+          sendJson(response, 200, { hostVersion, plugins: { ...npmPlugins, ...githubPlugins } })
         } catch (error) {
           sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
         }
@@ -4252,22 +4345,16 @@ export function mountMarketRoutes(
             }
           }
           pendingRollbacks.clear()
-          let ok: boolean
-          let reason: string | undefined
-          if (enabled && (await themes.installedThemeNames()).has(name)) {
+          const layers = enabled && (await themes.installedThemeNames()).has(name)
             // Theme exclusivity stays a Themes-page concern: enabling a theme
             // deactivates the previously active one, so only the last-enabled
             // theme is live (same semantics as use-skin).
-            ok = await themes.activateTheme(name)
-            if (!ok) reason = 'theme activation failed — restart required / 主题启用失败，需要重启'
-          } else {
-            const result = await setPluginEnabled(name, enabled)
-            ok = result.ok
-            reason = result.reason
-          }
-          const layers = await switchPluginLayers(name, enabled, ok, reason)
-          ok = layers.ok
-          reason = layers.reason
+            ? await switchPluginLayers(name, enabled, async () => {
+              const ok = await themes.activateTheme(name)
+              return { ok, reason: ok ? undefined : 'theme activation failed — restart required / 主题启用失败，需要重启' }
+            })
+            : await switchPluginLayers(name, enabled)
+          const { ok, reason } = layers
           const { patchRows, userRows, patchWrite, carrierRows, isCarrier, bundleSwitch } = layers
           // Activation reads the post-write truth: the switch state OR the
           // patch layer, so a disabled plugin never reports "restart to
@@ -4645,8 +4732,7 @@ export function mountMarketRoutes(
               } else {
                 // The same two durable layers the single switch writes (#696):
                 // which control flipped a plugin must not change what is on disk.
-                const live = await setPluginEnabled(member, enabled)
-                result = await switchPluginLayers(member, enabled, live.ok, live.reason)
+                result = await switchPluginLayers(member, enabled)
               }
               if (!result.ok) failures.push(member)
               // Same live-mismatch signal as the single toggle: a member
@@ -5221,7 +5307,7 @@ export function mountMarketRoutes(
               logEvent('warn', 'source-migration', `${name}: ${stateWarning}`)
             }
 
-            const cleanedOld = removeRowBlocks(userPatchPath, oldRows)
+            const cleanedOld = removeRowBlocks(userPatchPath, oldRows, name)
             if (!cleanedOld.ok) logEvent('warn', 'install', `patch rows could not be cleared — ${cleanedOld.reason}`)
             const patchDisabled = wasDisabled || patchFlags.disabled.includes(name)
             const patchForced = !patchDisabled && patchFlags.forced.includes(name)
@@ -5229,9 +5315,9 @@ export function mountMarketRoutes(
             for (const rowId of rowIdsForPackage(host, activeProfileDir, targetName)) {
               const expectedName = composedRowName(host, rowId)
               const changed = patchDisabled
-                ? await disableRow(userPatchPath, rowId, { expectedName })
+                ? await disableRow(userPatchPath, rowId, { expectedName, packageName: targetName })
                 : patchForced
-                  ? await enableRow(userPatchPath, rowId, { expectedName })
+                  ? await enableRow(userPatchPath, rowId, { expectedName, packageName: targetName })
                   : { ok: true, reason: null }
               if (!changed.ok && changed.reason !== null) patchWarnings.push(changed.reason)
             }
@@ -7120,7 +7206,7 @@ export function mountMarketRoutes(
               for (const name of disabled) {
                 const ids = rowIdsForPackage(host, activeProfileDir, name)
                 if (ids.length > 0) {
-                  const cleanedIds = removeRowBlocks(userPatchPath, ids)
+                  const cleanedIds = removeRowBlocks(userPatchPath, ids, name)
                   if (!cleanedIds.ok) logEvent('warn', 'patch', `patch rows could not be cleared — ${cleanedIds.reason}`)
                   restored.push(name)
                 }
@@ -7649,7 +7735,7 @@ export function mountMarketRoutes(
               // Patch-layer rows must not survive the remove either: a
               // `- id: X` + `disabled: true` row for a package that no longer
               // mounts is a boot-time orphan (port of dsh-plugin-hub).
-              const cleanedOwned = removeRowBlocks(userPatchPath, ownedRows)
+              const cleanedOwned = removeRowBlocks(userPatchPath, ownedRows, name)
               if (!cleanedOwned.ok) logEvent('warn', 'uninstall', `patch rows could not be cleared — ${cleanedOwned.reason}`)
               // Either way the record is settled: cleaned means nothing is
               // left to do, and an unclean file is reported above rather than

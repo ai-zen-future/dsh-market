@@ -168,6 +168,11 @@ const REGISTRY = {
     { name: 'whale-skin', owner: 'carol', url: 'https://github.com/carol/whale-skin', category: 'theme', npm: null, stars: 80, added: '2026-08-14', description: { en: 'Whale theme', zh: '鲸鱼主题' }, install: '' },
   ],
 }
+const UNDECLARED_COMPATIBILITY = { status: 'unknown', basis: 'undeclared', requirement: null, declarations: [] }
+const UNDECLARED_GITHUB_COMPATIBILITY = {
+  'https://github.com/bob/dsh-notify': UNDECLARED_COMPATIBILITY,
+  'https://github.com/carol/whale-skin': UNDECLARED_COMPATIBILITY,
+}
 
 /** Every fetch the component made, for asserting request payloads. */
 let fetchCalls: Array<{ path: string; method: string; body: unknown }> = []
@@ -199,7 +204,7 @@ function stubFetch(overrides: Record<string, unknown> = {}, mountPath = '') {
       : route === '/dsh-market/block' ? { ok: true, blocked: [] }
       : route === '/dsh-market/dismiss-broken' ? { ok: true, brokenPlugins: {} }
       : null
-    const merged = overrides[path] ?? overrides[route] ?? payload
+    const merged = overrides[String(input)] ?? overrides[path] ?? overrides[route] ?? payload
     if (merged === null) return Promise.reject(new Error(`unstubbed fetch: ${String(input)}`))
     const result = typeof merged === 'function' ? (merged as (requestBody?: unknown) => unknown)(body) : merged
     const status = result !== null && typeof result === 'object' && '__status' in result && typeof (result as { __status?: unknown }).__status === 'number'
@@ -592,6 +597,17 @@ describe('api() base resolution (#345)', () => {
       })
     }
 
+    it('lists the commits between the installed commit and the target under the release notes (#1193)', async () => {
+      await openNotes({
+        kind: 'release',
+        release: { tag: 'v1.2.0', name: null, publishedAt: null, url: null, body: 'Release notes body' },
+        commits: { items: [{ sha: 'c'.repeat(40), message: 'third change', date: '2026-08-26T03:00:00Z' }], found: true },
+      })
+      expect(await screen.findByText('Release notes body')).toBeTruthy()
+      expect(screen.getByText(en.notesCommits!)).toBeTruthy()
+      expect(screen.getByText('third change')).toBeTruthy()
+    })
+
     it('says the market has none yet and links to the repository, instead of blaming the plugin', async () => {
       await openNotes({ kind: 'source', reason: 'missing', sourceUrl: 'https://gitee.com/o/r' })
       expect(await screen.findByText(new RegExp(en.notesSource))).toBeTruthy()
@@ -713,6 +729,7 @@ describe('MarketSection (jsdom)', () => {
         hostVersion: '0.1.2-alpha.2',
         plugins: {
           'dsh-loop': { status: 'incompatible', basis: 'manifest', requirement: '^0.9.0', declarations: ['^0.9.0'] },
+          ...UNDECLARED_GITHUB_COMPATIBILITY,
         },
       },
     })
@@ -741,6 +758,7 @@ describe('MarketSection (jsdom)', () => {
         hostVersion: '0.1.2-alpha.2',
         plugins: {
           'dsh-loop': { status: 'incompatible', basis: 'manifest', requirement: '^0.9.0', declarations: ['^0.9.0'] },
+          ...UNDECLARED_GITHUB_COMPATIBILITY,
         },
       },
     })
@@ -786,6 +804,173 @@ describe('MarketSection (jsdom)', () => {
     expect(screen.getByRole('button', { name: /Update all \(1\)/ })).toBeTruthy()
   })
 
+  it.each([false, true])('retains confirmed updates on HTTP 500 and clears them on a genuine empty retry (installed error: %s) (#1200)', async installedError => {
+    const installed = { 'dsh-loop': '^1.0.0' }
+    let fail = false
+    const fetchMock = stubFetch({
+      '/dsh-market/installed': () => fail && installedError ? { error: 'read failed', __status: 400 } : { installed },
+      '/dsh-market/updates': () => fail ? { error: 'check failed', __status: 500 } : {
+        updates: { 'dsh-loop': { kind: 'npm', version: '1.0.0', latest: '1.1.0', updateAvailable: true } },
+      },
+      '/dsh-market/updates?force=1': { updates: {} },
+    })
+    const first = render(<MarketSection {...props()} />)
+    expect(await screen.findByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    first.unmount()
+    fail = true
+    render(<MarketSection {...props()} surface="sidebar" />)
+
+    expect(await screen.findByText('Could not check for updates')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    fail = false
+    fireEvent.click(screen.getByRole('button', { name: 'Retry update check' }))
+    await waitFor(() => {
+      expect(screen.queryByText('Could not check for updates')).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Update all (1)' })).toBeNull()
+    })
+    expect(fetchMock.mock.calls.some(([url]) => url === '/dsh-market/updates?force=1')).toBe(true)
+  })
+
+  it('surfaces an update HTTP failure and allows retry while the installed read is pending (#1200)', async () => {
+    let settleInstalled!: (response: Response) => void
+    const firstInstalled = new Promise<Response>(resolve => { settleInstalled = resolve })
+    const body = { installed: { 'dsh-loop': '^1.0.0' } }
+    const fetchMock = stubFetch({
+      '/dsh-market/installed': body,
+      '/dsh-market/updates': { error: 'check failed', __status: 500 },
+      '/dsh-market/updates?force=1': { updates: { 'dsh-loop': { kind: 'npm', latest: '1.1.0', updateAvailable: true } } },
+    })
+    let installedCalls = 0
+    const defaultFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((url, init) => {
+      if (url === '/dsh-market/installed' && ++installedCalls === 1) return firstInstalled
+      return defaultFetch(url, init)
+    })
+
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByText('Could not check for updates')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry update check' }))
+    expect(await screen.findByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    await act(async () => { settleInstalled(new Response(JSON.stringify({ installed: {} }))) })
+    expect(screen.getByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    expect(screen.queryByText('Could not check for updates')).toBeNull()
+  })
+
+  it.each(['network', 'invalid JSON', 'invalid row'])('offers a first-load retry after %s (#1200)', async failure => {
+    const fetchMock = stubFetch({ '/dsh-market/installed': { installed: { 'dsh-loop': '^1.0.0' } } })
+    const defaultFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((url, init) => {
+      if (url === '/dsh-market/updates') {
+        if (failure === 'network') return Promise.reject(new Error('offline'))
+        if (failure === 'invalid JSON') return Promise.resolve(new Response('<!DOCTYPE html>'))
+        return Promise.resolve(new Response(JSON.stringify({ updates: { 'dsh-loop': [] } })))
+      }
+      if (url === '/dsh-market/updates?force=1') return Promise.resolve(new Response(JSON.stringify({
+        updates: { 'dsh-loop': { kind: 'npm', version: '1.0.0', latest: '1.1.0', updateAvailable: true } },
+      })))
+      return defaultFetch(url, init)
+    })
+    render(<MarketSection {...props()} surface="plugins" />)
+
+    expect(await screen.findByText('Could not check for updates')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^Update all/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry update check' }))
+    expect(await screen.findByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    expect(screen.queryByText('Could not check for updates')).toBeNull()
+  })
+
+  it('retains only failed updates confirmed for the same installed plugin (#1200)', async () => {
+    let fail = false
+    const same = 'dsh-loop'
+    const changedSpec = 'dsh-notify'
+    const changedVersion = 'dsh-changed-version'
+    const exempt = 'dsh-exempt'
+    const removed = 'dsh-removed'
+    const previous = { kind: 'npm', version: '1.0.0', latest: '1.1.0', updateAvailable: true }
+    const failed = { kind: 'npm', version: '1.0.0', latest: null, updateAvailable: false, checkFailed: true }
+    stubFetch({
+      '/dsh-market/installed': () => ({
+        installed: { [same]: '^1.0.0', [changedSpec]: fail ? '~1.0.0' : '^1.0.0', [changedVersion]: '^1.0.0', [exempt]: '^1.0.0', ...(!fail && { [removed]: '^1.0.0' }) },
+        updateExempt: fail ? [exempt] : [],
+      }),
+      '/dsh-market/updates': () => ({ updates: fail
+        ? { [same]: failed, [changedSpec]: failed, [changedVersion]: { ...failed, version: '1.0.1' }, [exempt]: failed }
+        : { [same]: previous, [changedSpec]: previous, [changedVersion]: previous, [exempt]: previous, [removed]: previous } }),
+    })
+    const first = render(<MarketSection {...props()} />)
+    expect(await screen.findByRole('button', { name: 'Update all (5)' })).toBeTruthy()
+    first.unmount()
+    fail = true
+    render(<MarketSection {...props()} surface="sidebar" />)
+    expect(await screen.findByText('Could not check for updates')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+  })
+
+  it('ignores a late failure after a newer forced check succeeded (#1200)', async () => {
+    let settleOld!: (response: Response) => void
+    const old = new Promise<Response>(resolve => { settleOld = resolve })
+    const fetchMock = stubFetch({
+      '/dsh-market/installed': { installed: { 'dsh-loop': '^1.0.0' } },
+      '/dsh-market/updates?force=1': {
+        updates: { 'dsh-loop': { kind: 'npm', version: '1.0.0', latest: '1.1.0', updateAvailable: true } },
+      },
+    })
+    const defaultFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((url, init) => url === '/dsh-market/updates' ? old : defaultFetch(url, init))
+    const first = render(<MarketSection {...props()} />)
+    fireEvent.click(screen.getByRole('button', { name: re(en.tabInstalled) }))
+    expect(await screen.findByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    await act(async () => { settleOld(new Response(JSON.stringify({ error: 'old failure' }), { status: 500 })) })
+    expect(screen.getByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    expect(screen.queryByText('Could not check for updates')).toBeNull()
+    first.unmount()
+    render(<MarketSection {...props()} surface="sidebar" />)
+    expect(screen.getByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+  })
+
+  it('keeps installed data on a slower surface after another surface shares updates (#1200)', async () => {
+    let settleInstalled!: (response: Response) => void
+    const firstInstalled = new Promise<Response>(resolve => { settleInstalled = resolve })
+    const installed = { 'dsh-loop': '^1.0.0' }
+    const fetchMock = stubFetch({
+      '/dsh-market/installed': { installed },
+      '/dsh-market/updates': { updates: { 'dsh-loop': { kind: 'npm', latest: '1.1.0', updateAvailable: true } } },
+    })
+    let installedCalls = 0
+    const defaultFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((url, init) => {
+      if (url === '/dsh-market/installed' && ++installedCalls === 1) return firstInstalled
+      return defaultFetch(url, init)
+    })
+    const first = render(<MarketSection {...props()} />)
+    const other = render(<MarketSection {...props()} surface="sidebar" />)
+    expect(await within(other.container).findByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+    await act(async () => { settleInstalled(new Response(JSON.stringify({ installed }))) })
+    expect(within(first.container).getByRole('button', { name: 'Update all (1)' })).toBeTruthy()
+  })
+
+  it('keeps an unknown saved update pending and restores it only once after retry (#1200)', async () => {
+    const update = { kind: 'update', name: 'dsh-loop' }
+    localStorage.setItem('dshm-queue-v1', JSON.stringify([update]))
+    stubFetch({
+      '/dsh-market/installed': { installed: { 'dsh-loop': '^1.0.0' } },
+      '/dsh-market/updates': { updates: { 'dsh-loop': { kind: 'npm', version: '1.0.0', updateAvailable: false, checkFailed: true } } },
+      '/dsh-market/updates?force=1': { updates: { 'dsh-loop': { kind: 'npm', version: '1.0.0', latest: '1.1.0', updateAvailable: true } } },
+    })
+    const first = render(<MarketSection {...props()} />)
+    render(<MarketSection {...props()} surface="sidebar" />)
+    await within(first.container).findByText('Could not check for updates')
+    expect(document.querySelector('[class*="opPanel"]')).toBeNull()
+    expect(JSON.parse(localStorage.getItem('dshm-queue-v1')!)).toEqual([update])
+    fireEvent.click(within(first.container).getByRole('button', { name: 'Retry update check' }))
+    await waitFor(() => {
+      const panels = [...document.querySelectorAll('[class*="opPanel"]')]
+        .filter(panel => panel.querySelector('[class*="opPanelTitle"]') !== null)
+      expect(panels).toHaveLength(1)
+      expect(panels[0]?.textContent).toContain('dsh-loop')
+    })
+  })
+
   it('keeps the header package version across remounts (#846)', async () => {
     stubFetch({ '/dsh-market/status': { active: false, pnpm: true, boot: 'boot-1', restart: true, installed: {}, version: '1.66.28' } })
     const { unmount } = render(<MarketSection {...props()} />)
@@ -802,6 +987,7 @@ describe('MarketSection (jsdom)', () => {
         hostVersion: '0.1.2-alpha.2',
         plugins: {
           'dsh-loop': { status: 'incompatible', basis: 'manifest', requirement: '^0.9.0', declarations: ['^0.9.0'] },
+          ...UNDECLARED_GITHUB_COMPATIBILITY,
         },
       },
     })
@@ -816,6 +1002,7 @@ describe('MarketSection (jsdom)', () => {
         hostVersion: '0.2.0-rc.2',
         plugins: {
           'dsh-loop': { status: 'compatible', basis: 'manifest', requirement: '*', declarations: ['*'] },
+          ...UNDECLARED_GITHUB_COMPATIBILITY,
         },
       },
     })
@@ -870,6 +1057,325 @@ describe('MarketSection (jsdom)', () => {
     await act(async () => { release() })
     expect(await screen.findByText(en.hostFilterActive.replace('{0}', '0.1.2-alpha.2').replace('{1}', '1'))).toBeTruthy()
     expect(screen.queryByText(/Checking host requirements|正在检查宿主要求/)).toBeNull()
+  })
+
+  describe('discovery compatibility scan (#1170)', () => {
+    const hostVersion = '0.1.2-alpha.2'
+    const route = '/dsh-market/discovery-compatibility'
+    const declared = { status: 'compatible', basis: 'manifest', requirement: '*', declarations: [] }
+    const incompatible = { status: 'incompatible', basis: 'manifest', requirement: '^9.0.0', declarations: [] }
+
+    function catalog(count: number, version = '1.0.0') {
+      return {
+        ...REGISTRY, count,
+        plugins: Array.from({ length: count }, (_, index) => {
+          const name = `compat-plugin-${index}`
+          return { ...REGISTRY.plugins[0]!, name, npm: name, version, url: `https://github.com/alice/${name}` }
+        }),
+      }
+    }
+
+    async function selectFilter(compatible: boolean, surface?: HTMLElement) {
+      const name = compatible ? en.hostCompatible.replace('{0}', hostVersion) : en.hostAll
+      if (!screen.queryByRole('menuitem', { name })) {
+        fireEvent.click((surface === undefined ? screen : within(surface)).getByRole('button', { name: en.filter }))
+      }
+      fireEvent.click(await screen.findByRole('menuitem', { name }))
+    }
+
+    it('shares the pending catalog load across simultaneous market mounts', async () => {
+      const baseFetch = stubFetch({
+        [route]: { hostVersion, plugins: { 'compat-plugin-0': declared } },
+      })
+      let registryCalls = 0
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) !== '/dsh-market/registry') return baseFetch(input, init)
+        if (++registryCalls > 1) throw new Error('duplicate catalog read')
+        await gate
+        return Response.json({ hostVersion, registry: catalog(1) })
+      })
+
+      render(<MarketSection {...props()} />)
+      render(<MarketSection {...props()} />)
+      await act(async () => { release() })
+      expect(registryCalls).toBe(1)
+      expect(await screen.findAllByText('compat-plugin-0')).toHaveLength(2)
+    })
+
+    it('stops queued batches when Show all is selected and resumes without repeating completed packages', async () => {
+      localStorage.setItem('dshm-host-filter', 'all')
+      stubFetch({ '/dsh-market/registry': { source: 'live', registry: catalog(165), hostVersion } })
+      const baseFetch = globalThis.fetch
+      const calls: string[][] = []
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) !== route) return baseFetch(input, init)
+        const { packages } = JSON.parse(String(init?.body)) as { packages: string[] }
+        calls.push(packages)
+        if (calls.length === 2) await gate
+        return Response.json({ hostVersion, plugins: Object.fromEntries(packages.map(name => [name, declared])) })
+      })
+      render(<MarketSection {...props()} />)
+      await screen.findAllByText('DSH *')
+      await selectFilter(true)
+      await waitFor(() => expect(calls).toHaveLength(2))
+      await selectFilter(false)
+      await act(async () => { release() })
+      expect(calls).toHaveLength(2)
+      await selectFilter(true)
+      await waitFor(() => expect(calls.flat()).toHaveLength(165))
+      expect(new Set(calls.flat()).size).toBe(165)
+    })
+
+    it.each(['Show all in Sidebar', 'Clear filters in Plugins'])(
+      'stops the shared scan in Settings, Sidebar and Plugins via %s and still loads visible badges',
+      async (action) => {
+        localStorage.setItem('dshm-host-filter', 'all')
+        const first = 'compat-plugin-0'
+        const last = 'compat-plugin-164'
+        const requirement = '^0.1.0'
+        const progress = re(en.hostFilterLoading.split('{0}')[0]!)
+        const baseFetch = stubFetch({ '/dsh-market/registry': { registry: catalog(165), hostVersion } })
+        const calls: string[][] = []
+        let release!: () => void
+        const gate = new Promise<void>(resolve => { release = resolve })
+        vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input) !== route) return baseFetch(input, init)
+          const { packages } = JSON.parse(String(init?.body)) as { packages: string[] }
+          calls.push(packages)
+          if (packages.length > 24) await gate
+          return Response.json({ hostVersion, plugins: Object.fromEntries(packages.map(name => [name,
+            name === first ? incompatible : name === last ? { ...declared, requirement } : declared,
+          ])) })
+        })
+
+        const settings = render(<MarketSection {...props()} surface="settings" />).container
+        const sidebar = render(<MarketSection {...props()} surface="sidebar" />).container
+        const plugins = render(<MarketSection {...props()} surface="plugins" />).container
+        const surfaces = [settings, sidebar, plugins].map(container => within(container))
+        await within(settings).findByText(en.hostRequirement.replace('{0}', incompatible.requirement))
+        await selectFilter(true, settings)
+        await waitFor(() => expect(calls.filter(batch => batch.length > 24)).toHaveLength(1))
+        for (const view of surfaces) {
+          expect(view.getByText(progress)).toBeTruthy()
+          expect(view.queryByText(first)).toBeNull()
+        }
+
+        if (action === 'Show all in Sidebar') {
+          const filter = within(settings).getByRole('button', { name: en.filter })
+          if (screen.queryByRole('menuitem', { name: en.hostAll })) fireEvent.click(filter)
+          await selectFilter(false, sidebar)
+        } else {
+          const input = within(plugins).getByPlaceholderText(en.searchPh)
+          fireEvent.change(input, { target: { value: 'not-a-plugin' } })
+          fireEvent.keyDown(input, { key: 'Enter' })
+          fireEvent.click(await within(plugins).findByRole('button', { name: en.clearFilters }))
+        }
+        for (const view of surfaces) {
+          expect(view.queryByText(progress)).toBeNull()
+          expect(view.getByText(first)).toBeTruthy()
+        }
+
+        const input = within(settings).getByPlaceholderText(en.searchPh)
+        fireEvent.change(input, { target: { value: last } })
+        fireEvent.keyDown(input, { key: 'Enter' })
+        expect(await within(settings).findByText(en.hostRequirement.replace('{0}', requirement))).toBeTruthy()
+        expect(calls.at(-1)).toEqual([last])
+        const beforeRelease = calls.length
+        await act(async () => { release() })
+        expect(calls).toHaveLength(beforeRelease)
+      },
+    )
+
+    it('retries an unavailable visible entry after its cooldown in the same document', async () => {
+      let attempts = 0
+      stubFetch({
+        '/dsh-market/registry': { source: 'live', registry: catalog(1), hostVersion },
+        [route]: () => ({
+          hostVersion,
+          plugins: {
+            'compat-plugin-0': ++attempts === 1
+              ? { status: 'unknown', basis: 'unavailable', requirement: null, declarations: [], retryAfterMs: 100 }
+              : incompatible,
+          },
+        }),
+      })
+      render(<MarketSection {...props()} />)
+      expect(await screen.findByText(en.hostRequirementUnavailable)).toBeTruthy()
+      await waitFor(() => expect(screen.queryByText('compat-plugin-0')).toBeNull())
+      expect(attempts).toBe(2)
+    })
+
+    it('re-arms a twice-failed result on explicit return without bypassing the cooldown', async () => {
+      let attempts = 0
+      const reply = { status: 'unknown', basis: 'unavailable', requirement: null, declarations: [] }
+      stubFetch({
+        '/dsh-market/registry': { source: 'live', registry: catalog(1), hostVersion },
+        [route]: () => ({
+          hostVersion,
+          plugins: { 'compat-plugin-0': ++attempts <= 2 ? { ...reply, retryAfterMs: attempts === 1 ? 100 : 300 } : incompatible },
+        }),
+      })
+      render(<MarketSection {...props()} />)
+      await screen.findByText(en.hostRequirementUnavailable)
+      await waitFor(() => expect(attempts).toBe(2))
+      await selectFilter(false)
+      await selectFilter(true)
+      expect(attempts).toBe(2)
+      await waitFor(() => expect(screen.queryByText('compat-plugin-0')).toBeNull())
+      expect(attempts).toBe(3)
+    })
+
+    it('requests a new advertised npm version when the market panel reloads its catalog', async () => {
+      let version = '1.0.0'
+      stubFetch({
+        '/dsh-market/registry': () => ({ source: 'live', registry: catalog(1, version), hostVersion }),
+        [route]: (body: unknown) => {
+          const requested = (body as { versions?: Record<string, string> }).versions?.['compat-plugin-0']
+          return {
+            hostVersion,
+            plugins: {
+              'compat-plugin-0': requested === '2.0.0'
+                ? declared
+                : incompatible,
+            },
+          }
+        },
+      })
+      const view = render(<MarketSection {...props()} />)
+      expect(await screen.findByText(en.hostFilterActive.replace('{0}', hostVersion).replace('{1}', '1'))).toBeTruthy()
+      expect(screen.queryByText('compat-plugin-0')).toBeNull()
+      view.unmount()
+      version = '2.0.0'
+      render(<MarketSection {...props()} />)
+      expect(await screen.findByText('compat-plugin-0')).toBeTruthy()
+      expect(fetchCalls.some(call => call.path === route
+        && (call.body as { versions?: Record<string, string> }).versions?.['compat-plugin-0'] === '2.0.0')).toBe(true)
+    })
+
+    it('applies a catalog change for one GitHub revision while keeping the npm sibling verdict', async () => {
+      const npm = catalog(1).plugins[0]!
+      const url = 'https://github.com/alice/compat-github'
+      const oldRevision = '0'.repeat(64)
+      const newRevision = '1'.repeat(64)
+      const github = { ...npm, npm: null, name: 'compat-github', url, compatibilityRevision: oldRevision }
+      let catalogLoads = 0
+      stubFetch({
+        '/dsh-market/registry': () => ({
+          hostVersion,
+          registry: {
+            ...REGISTRY, count: 2,
+            plugins: [npm, catalogLoads++ === 0 ? github : { ...github, compatibilityRevision: newRevision }],
+          },
+        }),
+        [route]: (body: unknown) => {
+          const request = body as { packages: string[]; githubRevisions?: Record<string, string> }
+          const revision = request.githubRevisions?.[url]
+          return {
+            hostVersion,
+            plugins: {
+              ...(request.packages.includes(npm.name) ? { [npm.name]: incompatible } : {}),
+              ...(revision === undefined ? {} : { [url]: revision === oldRevision
+                ? { status: 'unknown', basis: 'unavailable', requirement: null, declarations: [], catalogChanged: true }
+                : declared }),
+            },
+          }
+        },
+      })
+      render(<MarketSection {...props()} />)
+      await screen.findByText('DSH *')
+      expect(screen.queryByText(npm.name)).toBeNull()
+      const payloads = fetchCalls.filter(call => call.path === route).map(call =>
+        call.body as { packages: string[]; githubRevisions?: Record<string, string> })
+      expect(payloads.filter(payload => payload.packages.includes(npm.name))).toHaveLength(1)
+      expect(payloads.map(payload => payload.githubRevisions?.[url])).toEqual([oldRevision, newRevision])
+      expect(catalogLoads).toBe(2)
+    })
+
+    it('refreshes a changed catalog if a full-scan reply arrives after rapid off and on', async () => {
+      const npm = catalog(25).plugins
+      const url = 'https://github.com/alice/off-page-github'
+      const oldRevision = '2'.repeat(64)
+      const newRevision = '3'.repeat(64)
+      const github = { ...npm[0]!, npm: null, name: 'off-page-github', url, compatibilityRevision: oldRevision }
+      let catalogLoads = 0
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const requested: string[] = []
+      localStorage.setItem('dshm-host-filter', 'all')
+      const baseFetch = stubFetch({
+        '/dsh-market/registry': () => ({
+          hostVersion,
+          registry: {
+            ...REGISTRY, count: 26,
+            plugins: [...npm, catalogLoads++ === 0 ? github : { ...github, compatibilityRevision: newRevision }],
+          },
+        }),
+      })
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) !== route) return baseFetch(input, init)
+        const request = JSON.parse(String(init?.body)) as { packages: string[]; githubRevisions?: Record<string, string> }
+        const revision = request.githubRevisions?.[url]
+        if (revision !== undefined) requested.push(revision)
+        if (revision === oldRevision) await gate
+        return Response.json({
+          hostVersion,
+          plugins: {
+            ...Object.fromEntries(request.packages.map(name => [name, declared])),
+            ...(revision === undefined ? {} : { [url]: revision === oldRevision
+              ? { status: 'unknown', basis: 'unavailable', requirement: null, declarations: [], catalogChanged: true }
+              : declared }),
+          },
+        })
+      })
+      render(<MarketSection {...props()} />)
+      await screen.findAllByText('DSH *')
+      await selectFilter(true)
+      await waitFor(() => expect(requested).toEqual([oldRevision]))
+      await selectFilter(false)
+      await selectFilter(true)
+      expect(requested).toEqual([oldRevision])
+      await act(async () => { release() })
+      await waitFor(() => expect(requested).toEqual([oldRevision, newRevision]))
+      expect(catalogLoads).toBe(2)
+    })
+
+    it('does not publish an older host or release reply after a newer catalog replaces its context', async () => {
+      const newerHost = '0.2.0-rc.2'
+      let version = '1.0.0'
+      stubFetch({ '/dsh-market/registry': () => ({
+        source: 'live', registry: catalog(1, version), hostVersion: version === '1.0.0' ? hostVersion : newerHost,
+      }) })
+      const baseFetch = globalThis.fetch
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const requested: string[] = []
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) !== route) return baseFetch(input, init)
+        const body = JSON.parse(String(init?.body)) as { versions: Record<string, string> }
+        const version = body.versions['compat-plugin-0']!
+        requested.push(version)
+        if (version === '1.0.0') await gate
+        return Response.json({
+          hostVersion: version === '1.0.0' ? hostVersion : newerHost,
+          plugins: { 'compat-plugin-0': version === '1.0.0' ? incompatible : declared },
+        })
+      })
+      const view = render(<MarketSection {...props()} />)
+      await waitFor(() => expect(requested).toEqual(['1.0.0']))
+      view.unmount()
+      version = '2.0.0'
+      render(<MarketSection {...props()} />)
+      await waitFor(() => expect(screen.getByText(/2\.0\.0/)).toBeTruthy())
+      await act(async () => { release() })
+      await screen.findByText('DSH *')
+      expect(screen.queryByText('DSH ^9.0.0')).toBeNull()
+      expect(screen.getByText('compat-plugin-0')).toBeTruthy()
+      expect(requested).toEqual(['1.0.0', '2.0.0'])
+    })
   })
 
   it('opens Discover with the host-provided plugin query', async () => {

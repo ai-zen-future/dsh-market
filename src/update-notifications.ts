@@ -135,9 +135,9 @@ export function createUpdateNotificationMonitor(deps: MonitorDependencies): Upda
             incomplete = true
             continue
           }
-          if (status.checkError !== undefined) {
+          if (status.checkFailed === true || status.checkError !== undefined) {
             incomplete = true
-            next[name] = { ...(updates[name] ?? status), checkError: status.checkError,
+            next[name] = { ...(updates[name] ?? status), checkFailed: true, checkError: 'unavailable',
               ...(status.sourceMigration === undefined ? {} : { sourceMigration: status.sourceMigration }) }
           } else {
             next[name] = status
@@ -154,7 +154,7 @@ export function createUpdateNotificationMonitor(deps: MonitorDependencies): Upda
       } catch {
         if (disposed) return { ...updates }
         reconcile()
-        updates = Object.fromEntries(Object.entries(updates).map(([name, status]) => [name, { ...status, checkError: 'unavailable' as const }]))
+        updates = Object.fromEntries(Object.entries(updates).map(([name, status]) => [name, { ...status, checkFailed: true as const, checkError: 'unavailable' as const }]))
         checkedAt = Date.now()
         stale = true
         error = 'Plugin updates could not be checked. Try again later.'

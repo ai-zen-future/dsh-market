@@ -18,12 +18,14 @@ const POLL_MS = 30_000
 export interface UpdateNotificationsState extends UpdateNotificationSnapshot {
   /** False until the local notification endpoint has answered successfully. */
   loaded: boolean
+  /** The last local request failed; retained data is not a fresh server sample. */
+  readFailed: boolean
 }
 
 const initialState = (): UpdateNotificationsState => ({
   enabled: false, intervalHours: DEFAULT_UPDATE_CHECK_INTERVAL_HOURS, checking: false, checkedAt: null, lastSuccessAt: null,
   nextCheckAt: null, stale: false, error: null, updates: {}, boot: '',
-  updateExempt: [], disabled: [], blocked: [], loaded: false,
+  updateExempt: [], disabled: [], blocked: [], loaded: false, readFailed: false,
 })
 
 function readIgnoredUpdates(boot: string, clearStale: boolean): string[] {
@@ -162,6 +164,7 @@ function isUpdateStatus(value: unknown): boolean {
     && ['current', 'latest', 'version'].every(key => value[key] === undefined || value[key] === null || typeof value[key] === 'string')
     && ['kind', 'eligibleVersion'].every(key => value[key] === undefined || typeof value[key] === 'string')
     && (value.checkError === undefined || value.checkError === 'unavailable')
+    && (value.checkFailed === undefined || value.checkFailed === true)
 }
 
 /** Reject a malformed local response instead of replacing a useful cached result. */
@@ -228,10 +231,10 @@ export function createUpdateNotificationsStore(request: typeof fetch = (...args)
       })
       if (!response.ok) throw new Error(`Update check unavailable (${response.status}). Try again.`)
       const next = readSnapshot(await response.json())
-      if (generation === lifecycle && sequence === requestSequence) publish({ ...next, loaded: true })
+      if (generation === lifecycle && sequence === requestSequence) publish({ ...next, loaded: true, readFailed: false })
     } catch (error) {
       if (generation !== lifecycle || controller.signal.aborted) return state
-      if (sequence === requestSequence) publish({ ...state, stale: true, error: error instanceof Error ? error.message : String(error) })
+      if (sequence === requestSequence) publish({ ...state, readFailed: true, stale: true, error: error instanceof Error ? error.message : String(error) })
       if (body !== undefined) throw error
     } finally {
       controllers.delete(controller)

@@ -119,4 +119,79 @@ describe('update notification page integration', () => {
     })
     expect(screen.getAllByText('dsh-loop').length).toBeGreaterThan(0)
   })
+
+  it('keeps successful background results when another package check failed', async () => {
+    render(<MarketSection {...props} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Installed/ }))
+    await screen.findByRole('button', { name: 'Update v1.2.0' })
+    await act(async () => { await updateNotifications.refreshAfterChange() })
+    const checkCount = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).split('?')[0] === '/dsh-market/updates').length
+
+    current = { ...current, checkedAt: 101, stale: true, error: 'One package is unavailable', updates: {
+      dshmarket: { ...current.updates.dshmarket!, checkFailed: true, checkError: 'unavailable' },
+      'dsh-loop': { ...current.updates['dsh-loop']!, latest: '1.3.0', eligibleVersion: '1.3.0' },
+    } }
+    await act(async () => { await updateNotifications.refreshAfterChange() })
+    await screen.findByRole('button', { name: 'Update v1.3.0' })
+    expect(screen.getByText(en.updateCheckFailed)).toBeTruthy()
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).split('?')[0] === '/dsh-market/updates')).toHaveLength(checkCount)
+  })
+
+  it.each([{ readFails: false, surfaces: 1 }, { readFails: true, surfaces: 1 }, { readFails: false, surfaces: 2 }, { readFails: true, surfaces: 2 }])('does not replay a notification sampled during a newer manual check ($surfaces surfaces, trailing read fails: $readFails)', async ({ readFails, surfaces }) => {
+    render(<><MarketSection {...props} />{surfaces === 2 && <MarketSection {...props} />}</>)
+    fireEvent.click((await screen.findAllByRole('button', { name: /Installed/ }))[0]!)
+    await screen.findByRole('button', { name: 'Update v1.2.0' })
+    await act(async () => { await updateNotifications.refreshAfterChange() })
+    const old = current
+    const fresh = { ...current, checkedAt: 102, updates: {
+      ...current.updates,
+      'dsh-loop': { ...current.updates['dsh-loop']!, latest: '1.4.0', eligibleVersion: '1.4.0' },
+    } }
+    const deferred = () => {
+      let resolve!: (response: Response) => void
+      const promise = new Promise<Response>(done => { resolve = done })
+      return { promise, resolve }
+    }
+    const manual = deferred()
+    const oldRead = deferred()
+    const freshRead = deferred()
+    const original = vi.mocked(fetch).getMockImplementation()!
+    let notificationReads = 0
+    let manualStarted = false
+    vi.mocked(fetch).mockImplementation((input, options) => {
+      const path = String(input)
+      if (path === '/dsh-market/updates?force=1') { manualStarted = true; return manual.promise }
+      if (path === '/dsh-market/update-notifications') {
+        notificationReads += 1
+        if (notificationReads === 1) return oldRead.promise
+        if (notificationReads === 2) return freshRead.promise
+        return Promise.resolve(new Response(JSON.stringify({ ...fresh, checkedAt: 103, updates: {
+          ...fresh.updates, 'dsh-loop': { ...fresh.updates['dsh-loop'], latest: '1.5.0', eligibleVersion: '1.5.0' },
+        } })))
+      }
+      return original(input, options)
+    })
+    fireEvent.click(screen.getAllByRole('button', { name: /Installed/ })[0]!)
+    await waitFor(() => { expect(manualStarted).toBe(true) })
+    const polling = updateNotifications.refresh()
+    await act(async () => { manual.resolve(new Response(JSON.stringify({ updates: fresh.updates }))); await Promise.resolve() })
+    await screen.findByRole('button', { name: 'Update v1.4.0' })
+    await act(async () => { oldRead.resolve(new Response(JSON.stringify(old))); await polling })
+    await waitFor(() => { expect(notificationReads).toBeGreaterThan(1) })
+    expect(screen.queryByRole('button', { name: 'Update v1.2.0' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Update v1.4.0' })).toBeTruthy()
+    await act(async () => {
+      freshRead.resolve(readFails ? new Response('', { status: 503 }) : new Response(JSON.stringify(fresh)))
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      if (readFails) expect(updateNotifications.getSnapshot().error).toContain('503')
+      else expect(updateNotifications.getSnapshot().checkedAt).toBe(102)
+    })
+    expect(screen.queryByRole('button', { name: 'Update v1.2.0' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Update v1.4.0' })).toBeTruthy()
+    await act(async () => { await updateNotifications.refreshAfterChange() })
+    await screen.findByRole('button', { name: 'Update v1.5.0' })
+  })
+
 })

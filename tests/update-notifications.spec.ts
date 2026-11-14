@@ -164,17 +164,20 @@ describe('background update notifications', () => {
     monitor.dispose()
   })
 
-  it('retains confirmed package results on partial failures and backs off', async () => {
+  it.each([
+    ['notification failure marker', unavailable],
+    ['upstream failure marker', { ...unavailable, checkError: undefined, checkFailed: true as const }],
+  ])('retains confirmed package results on partial failures and backs off (%s)', async (_label, failedStatus) => {
     const { monitor, check, setPackages } = setup()
     setPackages({ widget: 'npm:widget@1.0.0', other: 'npm:other@1.0.0' })
     check.mockResolvedValueOnce({ updates: { widget: available(), other: available() } })
     await monitor.check(true)
     const lastSuccessAt = monitor.snapshot().lastSuccessAt
-    check.mockResolvedValue({ updates: { widget: unavailable, other: available('1.0.0', '3.0.0') } })
+    check.mockResolvedValue({ updates: { widget: failedStatus, other: available('1.0.0', '3.0.0') } })
     await vi.advanceTimersByTimeAsync(1000)
     await monitor.check(true)
     expect(monitor.snapshot()).toMatchObject({ stale: true, lastSuccessAt, nextCheckAt: 1_061_000,
-      updates: { widget: { ...available(), checkError: 'unavailable' }, other: available('1.0.0', '3.0.0') } })
+      updates: { widget: { ...available(), checkFailed: true, checkError: 'unavailable' }, other: available('1.0.0', '3.0.0') } })
     await vi.advanceTimersByTimeAsync(60_000)
     expect(monitor.snapshot().nextCheckAt).toBe(1_181_000)
     expect(check).toHaveBeenLastCalledWith(true)
@@ -182,6 +185,7 @@ describe('background update notifications', () => {
     await monitor.check(true)
     expect(monitor.snapshot()).toMatchObject({ stale: false, error: null, updates: { widget: { updateAvailable: false } } })
     expect(monitor.snapshot().updates.widget?.checkError).toBeUndefined()
+    expect(monitor.snapshot().updates.widget?.checkFailed).toBeUndefined()
     monitor.dispose()
   })
 
