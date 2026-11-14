@@ -28,6 +28,11 @@ describe('decodeChildOutput', () => {
     expect(decodeChildOutput(GBK, 'darwin')).toContain('�')
   })
 
+  it('does not read a UTF-8 tail cut mid-character as GBK', () => {
+    const cut = Buffer.from('abc插件市场出错了', 'utf8').subarray(4)
+    expect(decodeChildOutput(cut, 'win32')).toBe('件市场出错了')
+  })
+
   it('answers an empty stream with an empty string', () => {
     expect(decodeChildOutput(Buffer.alloc(0))).toBe('')
   })
