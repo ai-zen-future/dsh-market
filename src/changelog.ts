@@ -494,8 +494,11 @@ export async function updateNotesFor(
           && (compareVersions(released, target) ?? 0) > 0
         // Attach the commit slice so the dialog can list what changed between
         // the installed commit and the update target, not just the release (#1193).
-        const commits = hasCommits ? sliceCommitsAt(entry.commits!, current) : undefined
-        const withCommits = commits === undefined ? {} : { commits }
+        // Only when the installed commit is found in the list: otherwise the
+        // slice is just "recent commits" unrelated to this update, and next to
+        // release notes it would be noise (npm installs never match a sha).
+        const sliced = hasCommits ? sliceCommitsAt(entry.commits!, current) : undefined
+        const withCommits = sliced !== undefined && sliced.found && sliced.items.length > 0 ? { commits: sliced } : {}
         return beyond
           ? { kind: 'release', release: entry.release, beyondTarget: target, ...withCommits }
           : { kind: 'release', release: entry.release, ...withCommits }
