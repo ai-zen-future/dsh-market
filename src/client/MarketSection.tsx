@@ -84,6 +84,7 @@ const SLOW_INSTALL_SECONDS = 90
 /** How long the page keeps asking for a market DSH unloaded, and how long one ask may take (#1151). */
 const RECONNECT_BUDGET_MS = 90_000
 const RECONNECT_REQUEST_MS = 4000
+const UPDATE_CHECK_REQUEST_MS = 30_000
 const IGNORED_UPDATES_SESSION_KEY = 'dshm-updates-ignored'
 
 /**
@@ -1871,9 +1872,49 @@ let cachedInstalled: InstalledMap | null = null
 let cachedLocalDescriptions: Record<string, string> = {}
 let cachedRepoIdentities: InstalledRepoIdentities | null = null
 let cachedRepoHints: InstalledRepoHints | null = null
-let cachedUpdates: Record<string, UpdateStatus> = {}
-/** False until /dsh-market/updates has answered at least once this process. */
-let cachedUpdatesReady = false
+interface UpdateCheckSnapshot {
+  updates: Record<string, UpdateStatus>
+  installed: InstalledMap
+  ready: boolean
+  /** null for a whole request failure, a set for failed packages only. */
+  failed: ReadonlySet<string> | null
+}
+
+const emptyUpdateCheck: UpdateCheckSnapshot = { updates: {}, installed: {}, ready: false, failed: new Set() }
+let updateCheckSnapshot = emptyUpdateCheck
+let updateCheckBoot: string | null = null
+let updateCheckRequest = 0
+let updateCheckCommitted = 0
+let installedCheckCommitted = 0
+const updateCheckListeners = new Set<() => void>()
+
+function getUpdateCheckSnapshot() { return updateCheckSnapshot }
+
+function subscribeUpdateCheck(listener: () => void): () => void {
+  updateCheckListeners.add(listener)
+  return () => { updateCheckListeners.delete(listener) }
+}
+
+function publishUpdateCheck(snapshot: UpdateCheckSnapshot): void {
+  updateCheckSnapshot = snapshot
+  for (const listener of updateCheckListeners) listener()
+}
+
+function resetUpdateCheck(boot: string | null): void {
+  updateCheckBoot = boot
+  updateCheckCommitted = ++updateCheckRequest
+  installedCheckCommitted = updateCheckRequest
+  publishUpdateCheck(emptyUpdateCheck)
+}
+
+function observeUpdateCheckBoot(boot: string, previous: string | null): boolean {
+  if (previous !== updateCheckBoot) return false
+  if (updateCheckBoot === null) updateCheckBoot = boot
+  if (updateCheckBoot === boot) return false
+  resetUpdateCheck(boot)
+  return true
+}
+
 let cachedInstalledReady = false
 let cachedSkins: string[] = []
 let cachedDisabledNames: string[] = []
@@ -1899,8 +1940,7 @@ function cacheState<T>(write: (value: T) => void, setState: (value: T | ((curren
 /** Test helper: drop the shared surface caches between cases. */
 export function resetHostCompatibilityCache(): void {
   discoveryScan.reset()
-  cachedUpdates = {}
-  cachedUpdatesReady = false
+  resetUpdateCheck(null)
   cachedInstalledReady = false
   cachedLocalDescriptions = {}
   cachedSkins = []
@@ -1987,6 +2027,55 @@ function localDescriptionsFromUnknown(value: unknown): Record<string, string> {
 /** A `{name: {...}}` map, or anything else — for untyped server fields. */
 function isRecordOfRecords(value: unknown): value is Record<string, { spec?: string; reason?: string }> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isInstalledSnapshot(value: unknown): value is InstalledMap {
+  return isRecordOfRecords(value) && Object.values(value).every(spec => typeof spec === 'string')
+}
+
+function isUpdateStatus(value: unknown): value is UpdateStatus {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const status = value as UpdateStatus
+  return typeof status.updateAvailable === 'boolean'
+    && (status.checkFailed === undefined || status.checkFailed === true)
+    && (status.kind === undefined || typeof status.kind === 'string')
+    && (status.version === undefined || status.version === null || typeof status.version === 'string')
+    && (status.latest === undefined || status.latest === null || typeof status.latest === 'string')
+    && (status.current === undefined || status.current === null || typeof status.current === 'string')
+}
+
+function readUpdateStatuses(body: unknown): Record<string, UpdateStatus> {
+  const updates = (body as { updates?: unknown } | null)?.updates
+  if (!isRecordOfRecords(updates) || !Object.values(updates).every(isUpdateStatus)) {
+    throw new Error('Invalid update list')
+  }
+  return updates as Record<string, UpdateStatus>
+}
+
+function applyUpdateCheck(request: number, received: Record<string, UpdateStatus> | null, installed: InstalledMap | null): void {
+  if (request < updateCheckCommitted) return
+  updateCheckCommitted = request
+  const previous = updateCheckSnapshot
+  const hasSameSpec = (name: string) => installed?.[name] !== undefined && installed[name] === previous.installed[name]
+  if (received === null) {
+    // A failed response says nothing about eligibility. A fresh installed list
+    // can still rule out rows for older installs or removed programs.
+    const updates = installed === null ? previous.updates
+      : Object.fromEntries(Object.entries(previous.updates).filter(([name]) => hasSameSpec(name)))
+    publishUpdateCheck({ ...previous, updates, installed: installed ?? previous.installed, failed: null })
+    return
+  }
+  const failed = new Set<string>()
+  const updates = Object.fromEntries(Object.entries(received).map(([name, status]) => {
+    if (status.checkFailed !== true) return [name, status]
+    failed.add(name)
+    const confirmed = previous.updates[name]
+    // A name can be reinstalled with a different source or local version.
+    if (hasSameSpec(name) && confirmed?.checkFailed !== true && typeof status.version === 'string'
+      && status.version === confirmed?.version && status.kind === confirmed.kind) return [name, confirmed]
+    return [name, status]
+  }))
+  publishUpdateCheck({ updates, installed: installed ?? {}, ready: installed !== null, failed })
 }
 
 function sameInstalledMap(left: InstalledMap, right: InstalledMap): boolean {
@@ -2452,7 +2541,6 @@ export function MarketSection(props: MarketSectionProps) {
   const [reconnecting, setReconnecting] = useState(true)
   const [reconnectRound, setReconnectRound] = useState(0)
   const [installed, setInstalledState] = useState<InstalledMap>(cachedInstalled ?? {})
-  const setInstalled = useCallback((value: InstalledMap) => { cachedInstalled = value; setInstalledState(value) }, [])
   const [localDescriptions, setLocalDescriptionsState] = useState<Record<string, string>>(() => cachedLocalDescriptions)
   const setLocalDescriptions = useCallback(cacheState(value => { cachedLocalDescriptions = value }, setLocalDescriptionsState), [])
   const [repoIdentities, setRepoIdentitiesState] = useState<InstalledRepoIdentities>(cachedRepoIdentities ?? {})
@@ -2528,13 +2616,10 @@ export function MarketSection(props: MarketSectionProps) {
    * Persisted in localStorage so a refresh keeps the queue; only `queued`
    * records persist — `running` recovery stays on the dshm-pending paths.
    */
-  const [updates, setUpdatesState] = useState<Record<string, UpdateStatus>>(() => cachedUpdates)
-  const setUpdates = useCallback(cacheState(value => { cachedUpdates = value }, setUpdatesState), [])
+  const updateCheck = useSyncExternalStore(subscribeUpdateCheck, getUpdateCheckSnapshot)
+  const { updates } = updateCheck
   const queueRestoredRef = useRef(false)
-  const [queueSnapshotReady, setQueueSnapshotReady] = useState({
-    installed: cachedInstalledReady,
-    updates: cachedUpdatesReady,
-  })
+  const [installedReady, setInstalledReady] = useState(cachedInstalledReady)
   useEffect(() => {
     if (queueRestoredRef.current) return
     let saved: unknown = null
@@ -2547,14 +2632,13 @@ export function MarketSection(props: MarketSectionProps) {
     }
     if (data === null) return
     // Cached or not-yet-loaded maps cannot judge a replacement's saved queue.
-    if (saved.some(row => row?.kind === 'update' || row?.kind === 'uninstall') && !queueSnapshotReady.installed) return
-    if (saved.some(row => row?.kind === 'update') && !queueSnapshotReady.updates) return
+    if (saved.some(row => row?.kind === 'update' || row?.kind === 'uninstall') && !installedReady) return
+    if (saved.some(row => row?.kind === 'update' && (
+      !updateCheck.ready || updateCheck.failed === null || updateCheck.failed.has(row.name)
+    ))) return
     queueRestoredRef.current = true
-    // Consumed only once the rows can actually be restored. Removing it
-    // earlier lost the queue outright: this effect runs on the first render,
-    // where `data === null` (the catalog has not arrived), and the run that
-    // follows found the storage empty — so a REFRESH with a pending queue, the
-    // case this feature exists for, threw it away.
+    // Claim the saved rows synchronously once they have enough evidence to
+    // restore, so a second mounted surface cannot restore the same tasks.
     try { localStorage.removeItem('dshm-queue-v1') } catch { /* storage unavailable */ }
     /**
      * A queued row may only run while the world it was queued in still holds.
@@ -2639,7 +2723,7 @@ export function MarketSection(props: MarketSectionProps) {
       return kept
     })
     setOperationsOpen(true)
-  }, [data, t, lang, queueSnapshotReady, installed, updates])
+  }, [data, t, lang, installedReady, installed, updateCheck, updates])
   useEffect(() => {
     // Never write before the restore has read. On the first render `records`
     // is empty, and this effect would then delete the stored queue that the
@@ -3250,15 +3334,45 @@ export function MarketSection(props: MarketSectionProps) {
   /** True while the drain is executing one queued request (no parallel starts). */
   const drainingRef = useRef(false)
 
+  const mounted = useRef(false)
+  const refreshRequest = useRef(0)
+  const [checkingUpdates, setCheckingUpdates] = useState(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      refreshRequest.current = 0
+    }
+  }, [])
+
   const refreshInstalled = useCallback((force?: boolean) => {
-    fetch(api('/dsh-market/installed'), { cache: 'no-store' })
-      .then(res => res.json())
+    if (!mounted.current) return
+    const request = ++updateCheckRequest
+    const boot = updateCheckBoot
+    refreshRequest.current = request
+    const ownsRefresh = () => mounted.current && refreshRequest.current === request
+    const isCurrent = () => ownsRefresh() && (boot === null || boot === updateCheckBoot)
+    setCheckingUpdates(true)
+    const requestOptions = { cache: 'no-store', signal: AbortSignal.timeout(UPDATE_CHECK_REQUEST_MS) } as const
+    const installRead = fetch(api('/dsh-market/installed'), requestOptions)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${String(res.status)}`)
+        return res.json()
+      })
       .then(body => {
-        setInstalled(body.installed || {})
+        if (!isCurrent() || !isInstalledSnapshot(body?.installed)) return null
+        const installed = body.installed
+        // Each surface renders its own installed list. A newer update check
+        // in a sibling surface can supersede the shared update response only.
+        if (request >= installedCheckCommitted) {
+          cachedInstalled = installed
+          installedCheckCommitted = request
+        }
+        setInstalledState(installed)
         setLocalDescriptions(localDescriptionsFromUnknown(body.descriptions))
         setRepoIdentities(installedRepoIdentities(body.repoIdentities))
         setRepoHints(installedRepoHints(body.repoHints))
-        setInstalledFiles(Array.isArray(body.present) ? body.present : Object.keys(body.installed || {}))
+        setInstalledFiles(Array.isArray(body.present) ? body.present : Object.keys(installed))
         setSkins(body.live || [])
         if (Array.isArray(body.disabled)) {
           setDisabledNames(body.disabled)
@@ -3306,18 +3420,28 @@ export function MarketSection(props: MarketSectionProps) {
         installedReadGen.current += 1
         setHostDependencyFindings(findings)
         cachedInstalledReady = true
-        setQueueSnapshotReady(ready => ({ ...ready, installed: true }))
+        setInstalledReady(true)
+        return installed
       })
-      .catch(() => {})
-    fetch(api('/dsh-market/updates') + (force === true ? '?force=1' : ''), { cache: 'no-store' })
-      .then(res => res.json())
-      .then(body => {
-        setUpdates(body.updates || {})
-        cachedUpdatesReady = true
-        setQueueSnapshotReady(ready => ({ ...ready, updates: true }))
+      .catch(() => null)
+    const updateRead = fetch(api('/dsh-market/updates') + (force === true ? '?force=1' : ''), requestOptions)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${String(res.status)}`)
+        return res.json()
       })
-      .catch(() => {})
-  }, [setActivations, setBlockedNames, setDisabledNames, setFavoriteUrls, setInstalledBundles, setInstalledFiles, setLocalDescriptions, setSkins, setUpdates])
+      .then(readUpdateStatuses)
+      .catch(() => {
+        // Expose a failed update check even when /installed is still loading.
+        // Reconcile any retained entries when that read has settled.
+        if (isCurrent()) applyUpdateCheck(request, null, null)
+        if (ownsRefresh()) setCheckingUpdates(false)
+        return null
+      })
+    void Promise.all([updateRead, installRead]).then(([received, installed]) => {
+      if (isCurrent()) applyUpdateCheck(request, received, installed)
+      if (ownsRefresh()) setCheckingUpdates(false)
+    })
+  }, [setActivations, setBlockedNames, setDisabledNames, setFavoriteUrls, setInstalledBundles, setInstalledFiles, setLocalDescriptions, setSkins])
 
   /**
    * Host-owned deferred operations (#411).
@@ -3596,6 +3720,8 @@ export function MarketSection(props: MarketSectionProps) {
    */
   const noteMarketGone = useCallback(() => {
     discoveryScan.setUnavailable()
+    refreshRequest.current = 0
+    setCheckingUpdates(false)
     setMarketGone(true)
     setBusyUrl(null)
     setUpdatingName(null)
@@ -3662,6 +3788,7 @@ export function MarketSection(props: MarketSectionProps) {
     let inFlight: AbortController | undefined
     let stopped = false
     const attempt = async (): Promise<void> => {
+      const boot = updateCheckBoot
       inFlight = new AbortController()
       const cutoff = setTimeout(() => inFlight?.abort(), RECONNECT_REQUEST_MS)
       try {
@@ -3669,6 +3796,7 @@ export function MarketSection(props: MarketSectionProps) {
         const status = res.ok ? await res.json() as Partial<MarketStatus> | null : null
         if (!stopped && status !== null && typeof status === 'object' && typeof status.boot === 'string') {
           discoveryScan.setBoot(status.boot)
+          observeUpdateCheckBoot(status.boot, boot)
           setMarketGone(false)
           void loadCatalog()
           refreshInstalled()
@@ -3695,6 +3823,7 @@ export function MarketSection(props: MarketSectionProps) {
 
   useEffect(() => {
     void loadCatalog()
+    const boot = updateCheckBoot
     fetch(api('/dsh-market/status'), { cache: 'no-store' })
       .then(readMarketStatus)
       .then(status => {
@@ -3715,6 +3844,7 @@ export function MarketSection(props: MarketSectionProps) {
         applyGithubRouting(status)
         if (typeof status.boot === 'string') {
           discoveryScan.setBoot(status.boot)
+          if (mounted.current && observeUpdateCheckBoot(status.boot, boot)) refreshInstalled()
           setBootId(status.boot)
           setIgnoredUpdateNames(ignoredUpdatesForBoot(status.boot))
           // A dismissal only silences the notice for the boot it was made
@@ -7411,6 +7541,7 @@ export function MarketSection(props: MarketSectionProps) {
       onClick={doExportLog}
     >{exportState === 'busy' ? t('exportingLog') : t('exportLog')}</Button>
   )
+  const updateCheckFailed = updateCheck.failed === null || updateCheck.failed.size > 0
 
   return (
     <div
@@ -7557,6 +7688,18 @@ export function MarketSection(props: MarketSectionProps) {
             }}
           />
         </div>
+        {!marketGone && updateCheckFailed && (
+          <div className={css.updateCheckNotice}>
+            <span role="status">{t('updateCheckFailed')}</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={t('updateCheckRetry')}
+              disabled={checkingUpdates}
+              onClick={() => refreshInstalled(true)}
+            >{t('loadRetry')}</Button>
+          </div>
+        )}
         {/* Backup & Restore and Diagnostics sit under Advanced rather than as
             their own top-level tabs — most users never need either, and having
             five peers up top buried the ones people actually reach for. */}
@@ -9073,7 +9216,9 @@ export function MarketSection(props: MarketSectionProps) {
                                                     >{t('install')}</Button>
                                                   </>
                                                 )
-                                              : <span className={css.metaTag} title={t('upToDate')}>{t('upToDate')}</span>}
+                                              : updateCheck.failed === null || updateCheck.failed.has(name)
+                                                ? null
+                                                : <span className={css.metaTag} title={t('upToDate')}>{t('upToDate')}</span>}
                                 {removingName === name && <span className={css.metaTag}>{t('uninstalling')}</span>}
                                 </span>
                                 </div>
