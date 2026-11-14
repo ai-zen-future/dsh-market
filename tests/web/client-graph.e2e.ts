@@ -13,13 +13,34 @@
  * HTML says whether the graph still names it.
  */
 
+import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { dshAvailable, launchMarketScaffold } from './scaffold.ts'
+import { dshAvailable, dshCommand, launchMarketScaffold } from './scaffold.ts'
 import type { WebScaffold } from './scaffold.ts'
 
 const CLIENT = 'dshm-e2e-fixture-client'
+
+/**
+ * dsh 0.1.0 prereleases (measured on rc.8, #1204) compute the page's client
+ * list once, at boot: a plugin mounted live is running but is not named in
+ * the page until the next start, so "the page stopped loading it" cannot be
+ * observed there at all. Later hosts keep the list in step with live entries.
+ * Named by version, never inferred from the failure, so every other host
+ * still gets the strict assertion.
+ */
+function hostServesClientListOnlyAtBoot(): boolean {
+  const cmd = dshCommand()
+  if (cmd === null) return false
+  const probe = spawnSync(cmd, ['--version'], {
+    shell: true,
+    encoding: 'utf8',
+    timeout: 30_000,
+    cwd: process.env.DSHM_E2E_DSH_CWD,
+  })
+  return /(?:^|[\s/])0\.1\.0-/.test(`${probe.stdout ?? ''}${probe.stderr ?? ''}`)
+}
 
 describe.skipIf(!dshAvailable()).sequential('web e2e: the client graph follows a live toggle (#1188)', () => {
   let scaffold: WebScaffold
@@ -58,10 +79,20 @@ describe.skipIf(!dshAvailable()).sequential('web e2e: the client graph follows a
     await settle()
   }
 
-  it('stops serving the browser half after: off, restart, live on, live off', async () => {
+  it('stops serving the browser half after: off, restart, live on, live off', async ctx => {
     const install = await post('/dsh-market/install', { url: `https://github.com/dshm-e2e/${CLIENT}` })
     expect(install.status).toBe(200)
     await settle()
+    if (hostServesClientListOnlyAtBoot() && !(await pageLoadsIt())) {
+      // Still prove the fixture has a browser half and the host half is up, so
+      // this skip cannot hide a plugin that never mounted.
+      expect(hostHistory()).toEqual(['apply'])
+      await scaffold.restart()
+      expect(await pageLoadsIt(), 'after a restart this host must list the browser half').toBe(true)
+      const note = 'SKIPPED on this host (#1204): it lists browser halves only at boot, so a live toggle cannot be observed in the page. Asserted on every other host.'
+      console.warn(`\n[client-graph.e2e] ${note}\n`)
+      ctx.skip(note)
+    }
     expect(await pageLoadsIt()).toBe(true)
 
     // The path that already worked: an entry the host composed itself.
